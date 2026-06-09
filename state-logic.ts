@@ -252,6 +252,17 @@ export function isWeakTopOfNoteState(state: EphemeralState): boolean {
 	return atOrigin;
 }
 
+/** Caret at document origin (line 0) regardless of scroll — scroll-only reading on mobile. */
+export function isCaretAtOrigin(state: EphemeralState): boolean {
+	if (!state.cursor) return true;
+	return (
+		state.cursor.from.line === 0 &&
+		state.cursor.from.ch === 0 &&
+		state.cursor.to.line === 0 &&
+		state.cursor.to.ch === 0
+	);
+}
+
 export function isWeakDefaultScrollSave(
 	proposed: EphemeralState,
 	existing: EphemeralState

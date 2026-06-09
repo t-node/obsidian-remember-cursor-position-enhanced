@@ -22,6 +22,7 @@ import {
 	isRegressiveScrollSave,
 	isWeakDefaultScrollSave,
 	isWeakTopOfNoteState,
+	isCaretAtOrigin,
 	analyzeMergeForNote,
 	explainApplyRejection,
 	shouldApplyMergedState,
@@ -2246,7 +2247,7 @@ export default class RememberCursorPosition extends Plugin {
 		if (!editor) return st;
 
 		let out = st;
-		if ((st.scroll ?? 0) > 20 && isWeakTopOfNoteState(st)) {
+		if ((st.scroll ?? 0) > 5 && isCaretAtOrigin(st)) {
 			const visibleLine = this.getLineAtScrollTop(editor);
 			if (visibleLine != null && visibleLine > 0) {
 				out = {
@@ -2256,7 +2257,7 @@ export default class RememberCursorPosition extends Plugin {
 						to: { line: visibleLine, ch: 0 },
 					},
 				};
-				this.logger.info('STATE', 'Captured visible line from scroll (caret was at top)', {
+				this.logger.info('STATE', 'Captured visible line from scroll (caret at origin)', {
 					notePath: fileName,
 					scroll: st.scroll,
 					visibleLine,

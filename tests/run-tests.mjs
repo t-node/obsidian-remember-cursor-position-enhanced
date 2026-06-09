@@ -437,6 +437,23 @@ test('analyzeMergeForNote reports winner device', () => {
 	assert.equal(r.merged.scroll, 40);
 });
 
+test('isCaretAtOrigin detects origin caret with deep scroll', () => {
+	function isCaretAtOrigin(state) {
+		if (!state.cursor) return true;
+		return (
+			state.cursor.from.line === 0 &&
+			state.cursor.from.ch === 0 &&
+			state.cursor.to.line === 0 &&
+			state.cursor.to.ch === 0
+		);
+	}
+	assert.equal(
+		isCaretAtOrigin({ scroll: 156, cursor: { from: { line: 0, ch: 0 }, to: { line: 0, ch: 0 } } }),
+		true
+	);
+	assert.equal(isWeakTopOfNoteState({ scroll: 156, cursor: { from: { line: 0, ch: 0 }, to: { line: 0, ch: 0 } } }), false);
+});
+
 test('findNearestHeadingLine finds heading above cursor', () => {
 	function findNearestHeadingLine(lines, line) {
 		const clamped = Math.max(0, Math.min(line, lines.length - 1));
