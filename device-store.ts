@@ -11,6 +11,9 @@ import {
 
 export const DEVICE_STORE_VERSION = 2;
 
+/** Vault-root folder synced by LiveSync (fast path — not under .obsidian). */
+export const RECOMMENDED_STATE_DIR = 'cursor-state';
+
 export interface NoteStateEntry extends EphemeralState {
 	/** Monotonic save counter on this device (hybrid clock). */
 	revision?: number;
@@ -310,6 +313,72 @@ export async function migrateLegacyFilesToDeviceStores(
 		const outPath = getDeviceStorePath(stateDir, deviceId);
 		await adapter.write(outPath, JSON.stringify(store));
 		result.storesWritten++;
+	}
+
+	return result;
+}
+
+export interface StateDirMigrationResult {
+	filesCopied: number;
+	filesMerged: number;
+	filesRemoved: number;
+	errors: string[];
+}
+
+/** Move device store files from an old folder (e.g. plugin/states) into the new LiveSync-friendly dir. */
+export async function migrateStateDirBetween(
+	fromDir: string,
+	toDir: string,
+	adapter: StateFileAdapter
+): Promise<StateDirMigrationResult> {
+	const result: StateDirMigrationResult = {
+		filesCopied: 0,
+		filesMerged: 0,
+		filesRemoved: 0,
+		errors: [],
+	};
+
+	if (fromDir === toDir) return result;
+	if (!(await adapter.exists(fromDir))) return result;
+
+	if (!(await adapter.exists(toDir))) {
+		// mkdir is handled by plugin ensureStateDir; list may still work on empty parent
+	}
+
+	const fromFiles = await adapter.listFiles(fromDir);
+	for (const fromPath of fromFiles) {
+		const name = fromPath.split('/').pop() ?? fromPath;
+		if (!isDeviceStoreFileName(name) || isSyncConflictFileName(name)) continue;
+
+		const toPath = `${toDir}/${name}`;
+		try {
+			const fromRaw = await adapter.read(fromPath);
+			const fromStore = parseDeviceStoreJson(fromRaw);
+			if (!fromStore) continue;
+
+			if (await adapter.exists(toPath)) {
+				const toRaw = await adapter.read(toPath);
+				const toStore = parseDeviceStoreJson(toRaw);
+				if (toStore && toStore.deviceId === fromStore.deviceId) {
+					const merged = mergeDeviceStores(toStore, fromStore);
+					await adapter.write(toPath, JSON.stringify(merged));
+					result.filesMerged++;
+				} else {
+					await adapter.write(toPath, fromRaw);
+					result.filesCopied++;
+				}
+			} else {
+				await adapter.write(toPath, fromRaw);
+				result.filesCopied++;
+			}
+
+			await adapter.remove(fromPath);
+			result.filesRemoved++;
+		} catch (e) {
+			result.errors.push(
+				`${name}: ${e instanceof Error ? e.message : String(e)}`
+			);
+		}
 	}
 
 	return result;

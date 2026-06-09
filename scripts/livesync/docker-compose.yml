@@ -1,0 +1,20 @@
+# CouchDB for Obsidian Self-hosted LiveSync (single-node, personal use).
+# Run: docker compose up -d
+# Stop: docker compose down
+
+services:
+  couchdb:
+    image: couchdb:3.4
+    container_name: obsidian-livesync-couchdb
+    restart: unless-stopped
+    ports:
+      - "5984:5984"
+    environment:
+      COUCHDB_USER: obsidian
+      COUCHDB_PASSWORD: ${COUCHDB_PASSWORD:-changeme}
+    volumes:
+      - couchdb-data:/opt/couchdb/data
+      - ./local.ini:/opt/couchdb/etc/local.d/livesync.ini:ro
+
+volumes:
+  couchdb-data:

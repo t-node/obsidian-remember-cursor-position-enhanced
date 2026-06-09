@@ -1,6 +1,6 @@
 {
   "name": "obsidian-remember-cursor-position",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Remember cursor and scroll position for each note",
   "main": "main.js",
   "scripts": {
@@ -8,7 +8,9 @@
     "build": "rollup --config rollup.config.js",
     "test": "node tests/run-tests.mjs",
     "deploy": "node scripts/deploy.mjs",
-    "release": "node scripts/release.mjs"
+    "release": "node scripts/release.mjs",
+    "vault-cleanup": "node scripts/vault-cleanup.mjs",
+    "livesync-setup": "powershell -ExecutionPolicy Bypass -File scripts/setup-livesync-couchdb.ps1"
   },
   "keywords": [],
   "author": "",

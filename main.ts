@@ -37,6 +37,8 @@ import {
 	parseDeviceStoreJson,
 	reapStateConflicts,
 	migrateLegacyFilesToDeviceStores,
+	migrateStateDirBetween,
+	RECOMMENDED_STATE_DIR,
 	pruneDeviceStore,
 	upsertNoteInStore,
 	type DeviceStateStore,
@@ -849,6 +851,17 @@ export default class RememberCursorPosition extends Plugin {
 		const migration = await migrateLegacyFilesToDeviceStores(stateDir, deviceId, adapter);
 		if (migration.notesMigrated > 0) {
 			this.logger.info('MIGRATE', 'Legacy per-note files migrated to device stores', { ...migration });
+		}
+
+		const legacyPluginStateDir = this.manifest.dir + '/states';
+		if (stateDir === RECOMMENDED_STATE_DIR && legacyPluginStateDir !== stateDir) {
+			const dirMigration = await migrateStateDirBetween(legacyPluginStateDir, stateDir, adapter);
+			if (dirMigration.filesCopied > 0 || dirMigration.filesMerged > 0) {
+				this.logger.info('MIGRATE', 'Moved device stores to cursor-state/', { ...dirMigration });
+			}
+			for (const err of dirMigration.errors) {
+				this.logger.warn('MIGRATE', 'State dir migration error', { err });
+			}
 		}
 
 		this.ownDeviceStoreCache = null;
@@ -1959,19 +1972,20 @@ export default class RememberCursorPosition extends Plugin {
 		if (settings.aggressiveCrossDeviceSync === undefined) {
 			settings.aggressiveCrossDeviceSync = true;
 		}
+		const legacyPluginStateDir = this.manifest.dir + '/states';
 		if (!settings.stateDir) {
-			if (loaded?.dbFileName && !loaded.dbFileName.endsWith('cursor-positions.json')) {
-				settings.stateDir = loaded.dbFileName.replace(/\/[^/]+$/, '/states');
-			} else {
-				settings.stateDir = this.manifest.dir + '/states';
-			}
+			settings.stateDir = RECOMMENDED_STATE_DIR;
+		} else if (settings.stateDir === legacyPluginStateDir) {
+			settings.stateDir = RECOMMENDED_STATE_DIR;
 		}
 
 		settings.deviceId = await this.loadLocalDeviceId();
 		this.settings = settings;
 
-		// Remove deviceId from synced data.json if a previous version stored it there.
-		if (_legacySyncedDeviceId) {
+		const switchedToLiveSyncDir =
+			settings.stateDir === RECOMMENDED_STATE_DIR &&
+			(loaded?.stateDir === legacyPluginStateDir || !loaded?.stateDir);
+		if (switchedToLiveSyncDir || _legacySyncedDeviceId) {
 			await this.saveSharedSettings(settings);
 		}
 	}
@@ -2013,13 +2027,14 @@ class SettingTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName('State storage folder')
 			.setDesc(
-				'v2: one consolidated file per device ({deviceId}.json) containing all note positions — ' +
-				'~7 files for 7 devices instead of thousands. Syncs via Syncthing/Obsidian Sync. ' +
-				'Legacy per-note files are migrated automatically on startup.'
+				'v2: one file per device ({deviceId}.json) with all note positions. ' +
+				'Default cursor-state/ at vault root syncs quickly via Self-hosted LiveSync. ' +
+				'Add cursor-state/ to Settings → Files & links → Excluded files. ' +
+				'Legacy plugin/states/ files migrate here automatically on startup.'
 			)
 			.addText((text) =>
 				text
-					.setPlaceholder('Example: .obsidian/plugins/remember-cursor-position-enhanced/states')
+					.setPlaceholder('cursor-state')
 					.setValue(this.plugin.settings.stateDir)
 					.onChange(async (value) => {
 						this.plugin.settings.stateDir = value;
