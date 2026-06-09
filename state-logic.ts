@@ -1,0 +1,338 @@
+export interface EphemeralState {
+	filePath?: string;
+	cursor?: {
+		from: { ch: number; line: number };
+		to: { ch: number; line: number };
+	};
+	scroll?: number;
+	lastModified?: number;
+	/** Monotonic revision on the source device (hybrid clock). */
+	revision?: number;
+	/** Nearest heading line above cursor (cross-device anchor). */
+	anchorLine?: number;
+}
+
+export interface TaggedNoteState extends EphemeralState {
+	sourceDeviceId?: string;
+}
+
+/** Wall-clock skew threshold (ms) before logging a suspected fast/slow device clock. */
+export const CLOCK_SKEW_LOG_THRESHOLD_MS = 120_000;
+
+export function getFileHash(filePath: string): string {
+	let hash1 = 0;
+	let hash2 = 0;
+	const prime1 = 31;
+	const prime2 = 37;
+
+	for (let i = 0; i < filePath.length; i++) {
+		const char = filePath.charCodeAt(i);
+		hash1 = (hash1 * prime1 + char) & 0x7fffffff;
+		hash2 = (hash2 * prime2 + char) & 0x7fffffff;
+	}
+
+	return hash1.toString(36) + hash2.toString(36) + filePath.length.toString(36);
+}
+
+/** Legacy shared path — read-only after v2 migration. */
+export function getStateFilePath(stateDir: string, notePath: string): string {
+	return `${stateDir}/${getFileHash(notePath)}.json`;
+}
+
+/** Legacy per-(note×device) path — read-only after v2 migration. */
+export function getPerDeviceStateFilePath(
+	stateDir: string,
+	notePath: string,
+	deviceId: string
+): string {
+	return `${stateDir}/${getFileHash(notePath)}-${deviceId}.json`;
+}
+
+export function normalizeStateFileBaseName(fileName: string): string {
+	return fileName.replace(/\.sync-conflict-[^/\\]+(?=\.json$)/i, '');
+}
+
+/** v2 consolidated store: states/{deviceId}.json (no hyphen in basename). */
+export function isDeviceStoreFileName(fileName: string): boolean {
+	const base = normalizeStateFileBaseName(fileName).replace(/\.json$/i, '');
+	if (!base || base.includes('-')) return false;
+	// Device IDs are always 8 chars (Math.random().toString(36).slice(2, 10)).
+	return /^[a-z0-9]{8}$/i.test(base);
+}
+
+export function isLegacyPerNoteStateFileName(fileName: string): boolean {
+	const base = normalizeStateFileBaseName(fileName).replace(/\.json$/i, '');
+	if (!base) return false;
+	if (base.includes('-')) return true;
+	return base.length > 16;
+}
+
+export function stateFileBelongsToNote(stateDir: string, notePath: string, filePath: string): boolean {
+	if (!filePath.startsWith(stateDir + '/') || !filePath.endsWith('.json')) {
+		return false;
+	}
+	const hash = getFileHash(notePath);
+	const base = normalizeStateFileBaseName(filePath.split('/').pop() ?? '').replace(/\.json$/, '');
+	return base === hash || base.startsWith(hash + '-');
+}
+
+export function isStateFilePath(stateDir: string, path: string): boolean {
+	if (!path.startsWith(stateDir + '/') || !path.endsWith('.json')) {
+		return false;
+	}
+	const fileName = path.split('/').pop() ?? '';
+	if (fileName.startsWith('~syncthing~') || fileName.includes('.tmp')) {
+		return false;
+	}
+	if (isSyncConflictStatePath(fileName)) return true;
+	if (isDeviceStoreFileName(fileName)) return true;
+	const base = normalizeStateFileBaseName(fileName).replace(/\.json$/, '');
+	return /^[a-z0-9]+(-[a-z0-9]+)?$/i.test(base);
+}
+
+export function isSyncConflictStatePath(fileName: string): boolean {
+	return /\.sync-conflict-/i.test(fileName);
+}
+
+export function isIgnorableStateListEntry(filePath: string): boolean {
+	const fileName = filePath.split('/').pop() ?? filePath;
+	return fileName.startsWith('~syncthing~') || fileName.includes('.tmp');
+}
+
+export function isValidState(st: EphemeralState): boolean {
+	return !!(st.cursor || (st.scroll != null && !isNaN(st.scroll)));
+}
+
+export function isEphemeralStatesEquals(state1: EphemeralState, state2: EphemeralState): boolean {
+	if (state1.cursor && !state2.cursor) return false;
+	if (!state1.cursor && state2.cursor) return false;
+
+	if (state1.cursor) {
+		if (state1.cursor.from.ch !== state2.cursor!.from.ch) return false;
+		if (state1.cursor.from.line !== state2.cursor!.from.line) return false;
+		if (state1.cursor.to.ch !== state2.cursor!.to.ch) return false;
+		if (state1.cursor.to.line !== state2.cursor!.to.line) return false;
+	}
+
+	const scroll1 = state1.scroll;
+	const scroll2 = state2.scroll;
+	if (scroll1 == null && scroll2 == null) {
+		// both absent
+	} else if (scroll1 == null || scroll2 == null) {
+		return false;
+	} else if (scroll1 !== scroll2) {
+		return false;
+	}
+
+	return true;
+}
+
+export function mergeStatesByTimestamp(
+	incoming: EphemeralState,
+	local: EphemeralState | null | undefined
+): EphemeralState {
+	const incomingTime = incoming.lastModified ?? 0;
+	const localTime = local?.lastModified ?? 0;
+	return incomingTime >= localTime ? incoming : (local as EphemeralState);
+}
+
+/**
+ * Compare two states from the same device: higher revision wins (immune to clock skew).
+ * Returns positive if `a` is newer than `b`.
+ */
+export function compareSameDeviceRevision(a: EphemeralState, b: EphemeralState): number {
+	const revA = a.revision ?? 0;
+	const revB = b.revision ?? 0;
+	if (revA !== revB) return revA - revB;
+	return (a.lastModified ?? 0) - (b.lastModified ?? 0);
+}
+
+/**
+ * Compare states from different devices: wall-clock lastModified wins.
+ * Returns positive if `a` is newer than `b`.
+ */
+export function compareAcrossDevices(a: TaggedNoteState, b: TaggedNoteState): number {
+	return (a.lastModified ?? 0) - (b.lastModified ?? 0);
+}
+
+/** Detect likely clock skew when timestamps disagree with revision ordering. */
+export function describeClockSkew(
+	winner: TaggedNoteState,
+	loser: TaggedNoteState
+): string | null {
+	if (!winner.sourceDeviceId || !loser.sourceDeviceId) return null;
+	if (winner.sourceDeviceId === loser.sourceDeviceId) return null;
+
+	const timeDiff = (winner.lastModified ?? 0) - (loser.lastModified ?? 0);
+	const revDiff = (winner.revision ?? 0) - (loser.revision ?? 0);
+
+	if (timeDiff > 0 && revDiff < 0 && Math.abs(timeDiff) > CLOCK_SKEW_LOG_THRESHOLD_MS) {
+		return (
+			`Possible clock skew: ${winner.sourceDeviceId} won on timestamp (+${timeDiff}ms) ` +
+			`but ${loser.sourceDeviceId} has higher revision (${loser.revision} vs ${winner.revision})`
+		);
+	}
+	if (timeDiff < 0 && revDiff > 0 && Math.abs(timeDiff) > CLOCK_SKEW_LOG_THRESHOLD_MS) {
+		return (
+			`Possible clock skew: ${loser.sourceDeviceId} has newer timestamp but lost to ` +
+			`${winner.sourceDeviceId} revision (${winner.revision} vs ${loser.revision})`
+		);
+	}
+	return null;
+}
+
+function pickNewerTagged(a: TaggedNoteState, b: TaggedNoteState): TaggedNoteState {
+	if (a.sourceDeviceId && b.sourceDeviceId && a.sourceDeviceId === b.sourceDeviceId) {
+		return compareSameDeviceRevision(a, b) >= 0 ? a : b;
+	}
+	return compareAcrossDevices(a, b) >= 0 ? a : b;
+}
+
+/** True when a save would move scroll back toward the top while disk already has a deeper position. */
+export function isRegressiveScrollSave(proposed: EphemeralState, existing: EphemeralState): boolean {
+	if (proposed.scroll == null || existing.scroll == null) return false;
+	if ((proposed.lastModified ?? 0) > (existing.lastModified ?? 0)) return false;
+	if (
+		proposed.revision != null &&
+		existing.revision != null &&
+		proposed.revision > existing.revision
+	) {
+		return false;
+	}
+	return proposed.scroll < existing.scroll - 5 && existing.scroll > 20;
+}
+
+/** Pick the newest valid state across devices (hybrid clock) with weak-scroll-0 guard. */
+export function mergeStatesFromAll(sources: EphemeralState[]): EphemeralState | null;
+export function mergeStatesFromAll(
+	sources: TaggedNoteState[],
+	options?: { onSkewDetected?: (message: string) => void }
+): EphemeralState | null;
+export function mergeStatesFromAll(
+	sources: (EphemeralState | TaggedNoteState)[],
+	options?: { onSkewDetected?: (message: string) => void }
+): EphemeralState | null {
+	const valid = sources.filter((st) => isValidState(st));
+	if (valid.length === 0) return null;
+
+	const tagged = valid as TaggedNoteState[];
+	let newest = tagged[0];
+	for (const candidate of tagged.slice(1)) {
+		const picked = pickNewerTagged(newest, candidate);
+		if (picked !== newest) {
+			const skew = describeClockSkew(picked, newest);
+			if (skew) options?.onSkewDetected?.(skew);
+		}
+		newest = picked;
+	}
+
+	for (const candidate of tagged) {
+		if (candidate === newest) continue;
+		if (
+			(candidate.scroll ?? 0) > 20 &&
+			isWeakDefaultScrollSave(newest, candidate)
+		) {
+			return candidate;
+		}
+	}
+
+	const { sourceDeviceId: _s, ...rest } = newest;
+	return rest;
+}
+
+export function isWeakTopOfNoteState(state: EphemeralState): boolean {
+	const scroll = state.scroll ?? 0;
+	if (scroll >= 5) return false;
+	const atOrigin =
+		!state.cursor ||
+		(state.cursor.from.line === 0 &&
+			state.cursor.from.ch === 0 &&
+			state.cursor.to.line === 0 &&
+			state.cursor.to.ch === 0);
+	return atOrigin;
+}
+
+export function isWeakDefaultScrollSave(
+	proposed: EphemeralState,
+	existing: EphemeralState
+): boolean {
+	if (existing.scroll == null || existing.scroll <= 20) return false;
+	return isWeakTopOfNoteState(proposed);
+}
+
+/** v2: states/{deviceId}.json — legacy: *-{deviceId}.json */
+export function isOwnDeviceStateFile(stateFilePath: string, deviceId: string): boolean {
+	const fileName = stateFilePath.split('/').pop() ?? stateFilePath;
+	const base = normalizeStateFileBaseName(fileName).replace(/\.json$/i, '');
+	return base === deviceId || base.endsWith(`-${deviceId}`);
+}
+
+export function getDeviceIdFromStorePath(stateFilePath: string): string | null {
+	const fileName = stateFilePath.split('/').pop() ?? '';
+	const base = normalizeStateFileBaseName(fileName).replace(/\.json$/i, '');
+	if (isDeviceStoreFileName(fileName)) return base;
+	const dash = base.lastIndexOf('-');
+	if (dash > 0) return base.slice(dash + 1);
+	return null;
+}
+
+export function shouldWatchForRemoteState(
+	stateFiles: string[],
+	deviceId: string,
+	merged: EphemeralState | null
+): boolean {
+	if (stateFiles.length === 0) return true;
+	const hasRemote = stateFiles.some((f) => {
+		const id = getDeviceIdFromStorePath(f);
+		return id != null && id !== deviceId;
+	});
+	if (hasRemote) return false;
+	return !merged || isWeakTopOfNoteState(merged);
+}
+
+export function shouldApplyMergedState(
+	disk: EphemeralState,
+	applied: EphemeralState | null | undefined
+): boolean {
+	if (!isValidState(disk)) return false;
+	if (!applied || !isValidState(applied)) return true;
+	if (isEphemeralStatesEquals(disk, applied)) return false;
+
+	const diskScroll = disk.scroll ?? 0;
+
+	if (diskScroll > 20 && isWeakDefaultScrollSave(applied, disk)) {
+		return true;
+	}
+
+	if ((applied.revision ?? 0) > (disk.revision ?? 0)) {
+		return false;
+	}
+
+	if ((applied.lastModified ?? 0) > (disk.lastModified ?? 0)) {
+		return false;
+	}
+
+	if ((disk.revision ?? 0) > (applied.revision ?? 0)) {
+		return true;
+	}
+
+	if ((disk.lastModified ?? 0) > (applied.lastModified ?? 0)) {
+		return true;
+	}
+
+	return false;
+}
+
+/** Find the nearest markdown heading line at or above `line` (for cross-device anchor). */
+export function findNearestHeadingLine(lines: string[], line: number): number {
+	const clamped = Math.max(0, Math.min(line, lines.length - 1));
+	for (let i = clamped; i >= 0; i--) {
+		if (/^#{1,6}\s/.test(lines[i])) return i;
+	}
+	return clamped;
+}
+
+export function getAnchorLineFromState(state: EphemeralState): number | undefined {
+	if (state.anchorLine != null) return state.anchorLine;
+	return state.cursor?.from.line;
+}

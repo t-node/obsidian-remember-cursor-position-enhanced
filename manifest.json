@@ -1,0 +1,10 @@
+{
+	"id": "remember-cursor-position-enhanced",
+	"name": "Remember cursor position (Enhanced)",
+	"version": "2.0.0",
+	"minAppVersion": "1.0.0",
+	"description": "Enhanced fork: per-note state files, cross-device sync, robust cursor and scroll memory",
+	"author": "Enhanced fork based on Dmitry Savosh",
+	"authorUrl": "https://github.com/dy-sh/obsidian-remember-cursor-position",
+	"isDesktopOnly": false
+}
