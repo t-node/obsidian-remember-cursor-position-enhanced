@@ -22,7 +22,8 @@ import {
 	isRegressiveScrollSave,
 	isWeakDefaultScrollSave,
 	isWeakTopOfNoteState,
-	mergeStatesFromAll,
+	analyzeMergeForNote,
+	explainApplyRejection,
 	shouldApplyMergedState,
 	shouldWatchForRemoteState,
 	isOwnDeviceStateFile,
@@ -167,6 +168,7 @@ export default class RememberCursorPosition extends Plugin {
 	remoteDeviceStoresCache = new Map<string, DeviceStateStore>();
 	/** Last seen storeRevision per remote device — detects LiveSync delivery without vault modify events. */
 	remoteStoreRevisionSnapshot = new Map<string, number>();
+	lastMergeAnalysis: { notePath: string; winnerDeviceId: string | null; candidates: import('./state-logic').MergeCandidateSummary[] } | null = null;
 
 	getLogDirPath(): string {
 		return LOG_DIR;
@@ -358,6 +360,14 @@ export default class RememberCursorPosition extends Plugin {
 				name: 'Clear debug log',
 				callback: () => {
 					void this.clearDebugLog();
+				},
+			});
+
+			this.addCommand({
+				id: 'log-cross-device-sync-status',
+				name: 'Log cross-device sync diagnostic (current note)',
+				callback: () => {
+					void this.logCrossDeviceSyncDiagnostic();
 				},
 			});
 
@@ -983,16 +993,41 @@ export default class RememberCursorPosition extends Plugin {
 			this.logger.debug('RESTORE', 'No state for note in device stores', {
 				notePath,
 				deviceStoreCount: stateFiles.length,
+				noteHash: getFileHash(notePath),
 			});
 			this.maybeSetCrossDeviceSyncWatch(notePath, stateFiles, null);
 			return null;
 		}
 
-		const merged = mergeStatesFromAll(tagged, {
+		const analysis = analyzeMergeForNote(tagged, {
 			onSkewDetected: (message) => this.logger.warn('SYNC', 'Clock skew detected', { message, notePath }),
 		});
+		this.lastMergeAnalysis = {
+			notePath,
+			winnerDeviceId: analysis.winnerDeviceId,
+			candidates: analysis.candidates,
+		};
+
+		const merged = analysis.merged;
 		if (!merged) {
 			return null;
+		}
+
+		const logLevel = tagged.length > 1 ? 'info' : 'debug';
+		const mergeLog = {
+			notePath,
+			noteHash: getFileHash(notePath),
+			winnerDeviceId: analysis.winnerDeviceId,
+			ownDeviceId: this.settings.deviceId,
+			candidateCount: analysis.candidates.length,
+			candidates: analysis.candidates,
+			weakScrollOverride: analysis.weakScrollOverride,
+			winner: summarizeState(merged),
+		};
+		if (logLevel === 'info') {
+			this.logger.info('SYNC', 'Merge winner for note', mergeLog);
+		} else {
+			this.logger.debug('RESTORE', 'Merged state from device stores', mergeLog);
 		}
 
 		if (!merged.filePath) merged.filePath = notePath;
@@ -1002,12 +1037,6 @@ export default class RememberCursorPosition extends Plugin {
 			return null;
 		}
 
-		this.logger.debug('RESTORE', 'Merged state from device stores', {
-			notePath,
-			sourceStoreCount: stores.length,
-			sourceDevices: stores.map((s) => s.deviceId),
-			state: summarizeState(merged),
-		});
 		this.maybeSetCrossDeviceSyncWatch(notePath, stateFiles, merged);
 		return merged;
 	}
@@ -1139,6 +1168,21 @@ export default class RememberCursorPosition extends Plugin {
 			}
 
 			let store = await this.loadOwnDeviceStore();
+			const noteHash = getFileHash(notePath);
+			const existingOwn = store.notes[noteHash];
+			if (existingOwn && isEphemeralStatesEquals(existingOwn, stateToSave)) {
+				this.logger.debug('SAVE', 'Skip write — own device entry unchanged', {
+					notePath,
+					noteHash,
+					scroll: stateToSave.scroll,
+					cursorLine: stateToSave.cursor?.from.line,
+				});
+				if (notePath === this.lastLoadedFileName) {
+					this.lastEphemeralState = { ...existingOwn, filePath: notePath };
+				}
+				return;
+			}
+
 			store = upsertNoteInStore(store, notePath, stateToSave);
 			await this.persistOwnDeviceStore(store);
 
@@ -1146,6 +1190,7 @@ export default class RememberCursorPosition extends Plugin {
 				notePath,
 				stateFilePath,
 				deviceId: this.settings.deviceId,
+				platform: this.getDevicePlatformLabel(),
 				storeRevision: store.storeRevision,
 				noteHash: getFileHash(notePath),
 				state: summarizeState(stateToSave),
@@ -1370,6 +1415,68 @@ export default class RememberCursorPosition extends Plugin {
 		this.debouncedSave(notePath, state);
 	}
 
+	async writeSyncDiagnostic(event: string, data: Record<string, unknown>): Promise<void> {
+		const deviceId = this.settings.deviceId ?? 'unknown';
+		const path = `${this.settings.stateDir}/.diag-${deviceId}.json`;
+		try {
+			let events: unknown[] = [];
+			if (await this.app.vault.adapter.exists(path)) {
+				const raw = await this.app.vault.adapter.read(path);
+				const parsed = JSON.parse(raw) as { events?: unknown[] };
+				events = parsed.events ?? [];
+			}
+			events.push({
+				ts: new Date().toISOString(),
+				event,
+				platform: this.getDevicePlatformLabel(),
+				deviceId,
+				deviceName: this.getDeviceLabel(),
+				pluginVersion: this.manifest.version,
+				...data,
+			});
+			if (events.length > 30) {
+				events = events.slice(events.length - 30);
+			}
+			await this.app.vault.adapter.write(
+				path,
+				JSON.stringify({ deviceId, updated: Date.now(), events }, null, 2)
+			);
+		} catch (e) {
+			this.logger.warn('SYNC', 'Failed to write sync diagnostic file', {
+				err: e instanceof Error ? e.message : String(e),
+			});
+		}
+	}
+
+	async logCrossDeviceSyncDiagnostic(): Promise<void> {
+		const file = this.app.workspace.getActiveFile();
+		if (!file) {
+			new Notice('Open a markdown note first.');
+			return;
+		}
+		const notePath = file.path;
+		await this.pollRemoteStateForActiveNote('manual-diagnostic');
+		const merged = await this.readMergedNoteState(notePath);
+		const editorNow = summarizeState(this.getEphemeralState());
+		const payload = {
+			notePath,
+			noteHash: getFileHash(notePath),
+			ownDeviceId: this.settings.deviceId,
+			platform: this.getDevicePlatformLabel(),
+			merge: this.lastMergeAnalysis,
+			merged: summarizeState(merged),
+			editorNow,
+			applied: summarizeState(this.lastEphemeralState),
+			remoteRevisions: Object.fromEntries(this.remoteStoreRevisionSnapshot),
+		};
+		this.logger.info('SYNC', 'Manual cross-device diagnostic', payload);
+		await this.writeSyncDiagnostic('manual-diagnostic', payload);
+		new Notice(
+			`RCP-E diagnostic logged. See rcp-enhanced-logs/ and cursor-state/.diag-${this.settings.deviceId}.json`
+		);
+		await this.logger.flushToFile();
+	}
+
 	async seedRemoteStoreRevisionSnapshot(): Promise<void> {
 		const ownId = this.settings.deviceId ?? 'unknown';
 		for (const filePath of await this.listDeviceStoreFiles()) {
@@ -1415,26 +1522,51 @@ export default class RememberCursorPosition extends Plugin {
 		}
 
 		if (!shouldApplyMergedState(merged, this.lastEphemeralState)) {
-			this.logger.debug('SYNC', 'Merged state not applied', {
+			const reason = explainApplyRejection(merged, this.lastEphemeralState);
+			const editorNow = summarizeState(this.getEphemeralState());
+			this.logger.info('SYNC', 'Merged state not applied', {
 				notePath,
 				trigger,
 				triggerFile,
+				reason,
+				winnerDeviceId: this.lastMergeAnalysis?.winnerDeviceId,
 				incoming: summarizeState(merged),
 				applied: summarizeState(this.lastEphemeralState),
+				editorNow,
+			});
+			void this.writeSyncDiagnostic('apply-rejected', {
+				notePath,
+				trigger,
+				reason,
+				winnerDeviceId: this.lastMergeAnalysis?.winnerDeviceId,
+				incoming: summarizeState(merged),
+				applied: summarizeState(this.lastEphemeralState),
+				editorNow,
 			});
 			return false;
 		}
 
+		const winnerDeviceId = this.lastMergeAnalysis?.winnerDeviceId ?? null;
 		this.logger.info('SYNC', 'Applying newer merged state', {
 			notePath,
 			trigger,
 			triggerFile,
+			winnerDeviceId,
+			ownDeviceId: this.settings.deviceId,
+			crossDevice: winnerDeviceId != null && winnerDeviceId !== this.settings.deviceId,
 			incomingTime: merged.lastModified ?? 0,
 			localTime: this.lastEphemeralState?.lastModified ?? 0,
-			sourceFileCount: (await this.listStateFilesForNote(notePath)).length,
+			editorBefore: summarizeState(this.getEphemeralState()),
 			state: summarizeState(merged),
 		});
-		await this.applyScrollState(notePath, merged, trigger);
+		await this.applyScrollState(notePath, merged, trigger, winnerDeviceId);
+		void this.writeSyncDiagnostic('apply-accepted', {
+			notePath,
+			trigger,
+			winnerDeviceId,
+			state: summarizeState(merged),
+			editorAfter: summarizeState(this.getEphemeralState()),
+		});
 		return true;
 	}
 
@@ -1465,6 +1597,8 @@ export default class RememberCursorPosition extends Plugin {
 
 				if (prev != null && parsed.storeRevision !== prev) {
 					remoteChanged = true;
+					const noteHash = getFileHash(notePath);
+					const remoteNote = parsed.notes[noteHash];
 					this.logger.info('SYNC', 'Remote device store revision changed (LiveSync/poll)', {
 						trigger,
 						deviceId,
@@ -1472,6 +1606,10 @@ export default class RememberCursorPosition extends Plugin {
 						prevRevision: prev,
 						newRevision: parsed.storeRevision,
 						activeNote: notePath,
+						activeNoteHash: noteHash,
+						remoteNoteForActive: remoteNote
+							? summarizeState({ ...remoteNote, filePath: notePath })
+							: null,
 					});
 				}
 			} catch (e) {
@@ -1705,7 +1843,12 @@ export default class RememberCursorPosition extends Plugin {
 
 		this.loadingFile = false;
 		this.lastLoadedFileName = file.path;
-		await this.applyScrollState(file.path, st, 'force-restore-command');
+		await this.applyScrollState(
+			file.path,
+			st,
+			'force-restore-command',
+			this.lastMergeAnalysis?.winnerDeviceId ?? null
+		);
 		new Notice(`Restored scroll ${st.scroll?.toFixed(1)}% (from ${files.length} state file(s)).`);
 	}
 
@@ -1826,13 +1969,19 @@ export default class RememberCursorPosition extends Plugin {
 			notePath,
 			state: summarizeState(st),
 		});
-		await this.applyScrollState(notePath, st, 'delayed-re-restore');
+		await this.applyScrollState(
+			notePath,
+			st,
+			'delayed-re-restore',
+			this.lastMergeAnalysis?.winnerDeviceId ?? null
+		);
 	}
 
 	async applyScrollState(
 		notePath: string,
 		st: EphemeralState,
-		reason: string
+		reason: string,
+		sourceDeviceId: string | null = null
 	): Promise<void> {
 		await this.delay(this.settings.delayAfterFileOpening);
 		if (this.app.workspace.containerEl.querySelector('.is-flashing')) {
@@ -1840,26 +1989,48 @@ export default class RememberCursorPosition extends Plugin {
 			return;
 		}
 
+		const ownId = this.settings.deviceId ?? 'unknown';
+		const crossDevice = sourceDeviceId != null && sourceDeviceId !== ownId;
+		const editorBefore = summarizeState(this.getEphemeralState());
+
 		await this.delay(10);
 		this.logger.info('RESTORE', 'Applying saved state to editor', {
 			notePath,
 			reason,
+			sourceDeviceId,
+			crossDevice,
+			platform: this.getDevicePlatformLabel(),
 			state: summarizeState(st),
-			stateFilePath: this.getStateFilePathForNote(notePath),
+			editorBefore,
 		});
-		this.setEphemeralState(st);
+		this.setEphemeralState(st, { crossDevice, sourceDeviceId });
 		this.lastEphemeralState = st;
 		this.restoreGraceUntil = Date.now() + RESTORE_GRACE_MS;
 		if ((st.scroll ?? 0) > 20) {
 			this.clearCrossDeviceSyncWatch(notePath);
 		}
-		await this.verifyScrollRestore(notePath, st);
+		const editorAfter = summarizeState(this.getEphemeralState());
+		this.logger.info('RESTORE', 'After apply — editor state', {
+			notePath,
+			reason,
+			crossDevice,
+			target: summarizeState(st),
+			editorAfter,
+			scrollDelta: (editorAfter.scroll as number ?? 0) - (st.scroll ?? 0),
+		});
+		await this.verifyScrollRestore(notePath, st, crossDevice);
 	}
 
-	async verifyScrollRestore(notePath: string, target: EphemeralState): Promise<void> {
+	async verifyScrollRestore(
+		notePath: string,
+		target: EphemeralState,
+		crossDevice = false
+	): Promise<void> {
 		if (target.scroll == null || target.scroll < 20) {
 			return;
 		}
+
+		const tolerance = crossDevice ? 80 : 15;
 
 		for (let attempt = 0; attempt < 4; attempt++) {
 			await this.delay(attempt === 0 ? 80 : 150 * attempt);
@@ -1869,35 +2040,56 @@ export default class RememberCursorPosition extends Plugin {
 
 			const currentScroll = this.getEphemeralState().scroll ?? 0;
 			const targetScroll = target.scroll ?? 0;
-			if (Math.abs(currentScroll - targetScroll) <= 15) {
-				if (attempt > 0) {
-					this.logger.info('RESTORE', 'Scroll verify succeeded after retry', {
+			if (Math.abs(currentScroll - targetScroll) <= tolerance) {
+				if (attempt > 0 || crossDevice) {
+					this.logger.info('RESTORE', 'Scroll verify OK', {
 						notePath,
 						attempt,
+						crossDevice,
+						tolerance,
 						targetScroll,
 						currentScroll,
+						targetLine: target.cursor?.from.line,
+						currentLine: this.getEphemeralState().cursor?.from.line,
 					});
 				}
 				return;
 			}
 
+			if (crossDevice && target.cursor) {
+				const currentLine = this.getEphemeralState().cursor?.from.line;
+				if (currentLine != null && Math.abs(currentLine - target.cursor.from.line) <= 2) {
+					this.logger.info('RESTORE', 'Cross-device line verify OK (scroll pixels differ by platform)', {
+						notePath,
+						targetLine: target.cursor.from.line,
+						currentLine,
+						targetScroll,
+						currentScroll,
+					});
+					return;
+				}
+			}
+
 			// User scrolled shallower than restore target — never yank them back down.
-			if (currentScroll < targetScroll - 15) {
-				this.logger.debug('RESTORE', 'Scroll verify skipped — editor is above restore target', {
+			if (currentScroll < targetScroll - tolerance) {
+				this.logger.info('RESTORE', 'Scroll verify skipped — editor is above restore target', {
 					notePath,
+					crossDevice,
 					targetScroll,
 					currentScroll,
+					targetLine: target.cursor?.from.line,
 				});
 				return;
 			}
 
 			this.logger.warn('RESTORE', 'Scroll verify failed — reapplying scroll', {
 				notePath,
+				crossDevice,
 				attempt: attempt + 1,
 				targetScroll,
 				currentScroll,
 			});
-			this.setEphemeralState(target);
+			this.setEphemeralState(target, { crossDevice, sourceDeviceId: null });
 		}
 	}
 
@@ -2025,16 +2217,23 @@ export default class RememberCursorPosition extends Plugin {
 		}
 	}
 
-	setEphemeralState(state: EphemeralState) {
+	setEphemeralState(
+		state: EphemeralState,
+		options?: { crossDevice?: boolean; sourceDeviceId?: string | null }
+	) {
 		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
 		const editor = this.getEditor();
 		const anchorLine = getAnchorLineFromState(state);
+		const crossDevice = options?.crossDevice ?? false;
 
 		this.logger.debug('RESTORE', 'setEphemeralState called', {
 			hasView: !!view,
 			hasCursor: !!state.cursor,
 			scroll: state.scroll,
 			anchorLine,
+			crossDevice,
+			sourceDeviceId: options?.sourceDeviceId,
+			platform: this.getDevicePlatformLabel(),
 		});
 
 		if (state.cursor && editor) {
@@ -2045,17 +2244,26 @@ export default class RememberCursorPosition extends Plugin {
 			});
 		}
 
-		// Anchor restore: scroll to line/heading first (accurate across screen sizes), then apply saved scroll.
-		if (editor && anchorLine != null) {
+		// Cross-device: line/heading anchor is reliable; raw scroll pixels differ by screen/font.
+		const scrollTargetLine =
+			state.cursor?.from.line ?? anchorLine;
+		if (editor && scrollTargetLine != null) {
+			try {
+				const lineCh = { line: scrollTargetLine, ch: state.cursor?.from.ch ?? 0 };
+				editor.scrollIntoView({ from: lineCh, to: lineCh }, true);
+			} catch {
+				// fall through
+			}
+		} else if (editor && anchorLine != null) {
 			try {
 				const lineCh = { line: anchorLine, ch: 0 };
 				editor.scrollIntoView({ from: lineCh, to: lineCh }, true);
 			} catch {
-				// fall through to percentage scroll
+				// fall through
 			}
 		}
 
-		if (view && state.scroll != null && !isNaN(state.scroll)) {
+		if (view && state.scroll != null && !isNaN(state.scroll) && !crossDevice) {
 			view.setEphemeralState({ scroll: state.scroll });
 			const mode = view.currentMode;
 			if (mode && typeof mode.applyScroll === 'function') {
@@ -2069,10 +2277,17 @@ export default class RememberCursorPosition extends Plugin {
 					retryMode.applyScroll(state.scroll!);
 				}
 			});
+		} else if (crossDevice && state.scroll != null) {
+			this.logger.info('RESTORE', 'Cross-device restore — skipped pixel scroll (using line anchor)', {
+				remoteScroll: state.scroll,
+				line: scrollTargetLine,
+				anchorLine,
+			});
 		} else if (state.scroll != null) {
 			this.logger.warn('RESTORE', 'setEphemeralState — scroll not applied', {
 				scroll: state.scroll,
 				hasView: !!view,
+				crossDevice,
 			});
 		}
 	}
@@ -2254,6 +2469,13 @@ class SettingTab extends PluginSettingTab {
 			);
 
 		containerEl.createEl('h3', { text: 'Debug logging' });
+		containerEl.createEl('p', {
+			text:
+				'Logs: rcp-enhanced-logs/{DeviceName}-{deviceId}.log (per device). ' +
+				'Sync diagnostics (sync via LiveSync): cursor-state/.diag-{deviceId}.json. ' +
+				'Command palette: "Log cross-device sync diagnostic (current note)".',
+			cls: 'setting-item-description',
+		});
 
 		new Setting(containerEl)
 			.setName('Device name')

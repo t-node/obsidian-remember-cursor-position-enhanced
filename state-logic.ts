@@ -323,6 +323,105 @@ export function shouldApplyMergedState(
 	return false;
 }
 
+export interface MergeCandidateSummary {
+	deviceId: string;
+	scroll?: number;
+	cursorLine?: number;
+	anchorLine?: number;
+	lastModified?: number;
+	revision?: number;
+}
+
+export interface MergeAnalysis {
+	merged: EphemeralState | null;
+	winnerDeviceId: string | null;
+	candidates: MergeCandidateSummary[];
+	weakScrollOverride?: string;
+}
+
+function summarizeCandidate(st: TaggedNoteState): MergeCandidateSummary {
+	return {
+		deviceId: st.sourceDeviceId ?? '?',
+		scroll: st.scroll,
+		cursorLine: st.cursor?.from.line,
+		anchorLine: st.anchorLine,
+		lastModified: st.lastModified,
+		revision: st.revision,
+	};
+}
+
+/** Merge with full audit trail for debug logging. */
+export function analyzeMergeForNote(
+	sources: TaggedNoteState[],
+	options?: { onSkewDetected?: (message: string) => void }
+): MergeAnalysis {
+	const valid = sources.filter((st) => isValidState(st));
+	const candidates = valid.map(summarizeCandidate);
+	if (valid.length === 0) {
+		return { merged: null, winnerDeviceId: null, candidates };
+	}
+
+	let newest = valid[0];
+	for (const candidate of valid.slice(1)) {
+		const picked = pickNewerTagged(newest, candidate);
+		if (picked !== newest) {
+			const skew = describeClockSkew(picked, newest);
+			if (skew) options?.onSkewDetected?.(skew);
+		}
+		newest = picked;
+	}
+
+	let weakScrollOverride: string | undefined;
+	for (const candidate of valid) {
+		if (candidate === newest) continue;
+		if (
+			(candidate.scroll ?? 0) > 20 &&
+			isWeakDefaultScrollSave(newest, candidate)
+		) {
+			newest = candidate;
+			weakScrollOverride = `weak-scroll-0 from ${newest.sourceDeviceId} beat timestamp winner`;
+			break;
+		}
+	}
+
+	const { sourceDeviceId, ...rest } = newest;
+	return {
+		merged: rest,
+		winnerDeviceId: sourceDeviceId ?? null,
+		candidates,
+		weakScrollOverride,
+	};
+}
+
+/** Human-readable reason when shouldApplyMergedState returns false. */
+export function explainApplyRejection(
+	disk: EphemeralState,
+	applied: EphemeralState | null | undefined
+): string {
+	if (!isValidState(disk)) return 'merged state invalid';
+	if (!applied || !isValidState(applied)) return 'no local state — would apply';
+	if (isEphemeralStatesEquals(disk, applied)) return 'already equal to editor state';
+
+	const diskScroll = disk.scroll ?? 0;
+	if (diskScroll > 20 && isWeakDefaultScrollSave(applied, disk)) {
+		return 'would apply (weak local top-of-note vs remote scroll)';
+	}
+
+	if ((applied.revision ?? 0) > (disk.revision ?? 0)) {
+		return `local revision newer (${applied.revision} > ${disk.revision ?? 0})`;
+	}
+	if ((applied.lastModified ?? 0) > (disk.lastModified ?? 0)) {
+		return `local timestamp newer (${applied.lastModified} > ${disk.lastModified ?? 0})`;
+	}
+	if ((disk.revision ?? 0) > (applied.revision ?? 0)) {
+		return 'would apply (merged revision newer)';
+	}
+	if ((disk.lastModified ?? 0) > (applied.lastModified ?? 0)) {
+		return 'would apply (merged timestamp newer)';
+	}
+	return 'states differ but timestamps/revisions tied';
+}
+
 /** Find the nearest markdown heading line at or above `line` (for cross-device anchor). */
 export function findNearestHeadingLine(lines: string[], line: number): number {
 	const clamped = Math.max(0, Math.min(line, lines.length - 1));

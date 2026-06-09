@@ -193,6 +193,35 @@ function test(name, fn) {
 	}
 }
 
+function explainApplyRejection(disk, applied) {
+	if (!isValidState(disk)) return 'merged state invalid';
+	if (!applied || !isValidState(applied)) return 'no local state — would apply';
+	if (isEphemeralStatesEquals(disk, applied)) return 'already equal to editor state';
+	if ((applied.lastModified ?? 0) > (disk.lastModified ?? 0)) {
+		return `local timestamp newer (${applied.lastModified} > ${disk.lastModified ?? 0})`;
+	}
+	return 'other';
+}
+
+function analyzeMergeForNote(sources) {
+	const valid = sources.filter((st) => isValidState(st));
+	if (valid.length === 0) return { merged: null, winnerDeviceId: null, candidates: [] };
+	let newest = valid[0];
+	for (const c of valid.slice(1)) {
+		newest = pickNewerTagged(newest, c);
+	}
+	const { sourceDeviceId, ...rest } = newest;
+	return {
+		merged: rest,
+		winnerDeviceId: sourceDeviceId ?? null,
+		candidates: valid.map((s) => ({
+			deviceId: s.sourceDeviceId,
+			scroll: s.scroll,
+			lastModified: s.lastModified,
+		})),
+	};
+}
+
 console.log('\nRemember Cursor Position — automated tests\n');
 
 test('getFileHash is stable for same path', () => {
@@ -389,6 +418,23 @@ test('shouldApplyMergedState does not yank scroll when editor is newer', () => {
 		),
 		false
 	);
+});
+
+test('explainApplyRejection describes local timestamp win', () => {
+	const reason = explainApplyRejection(
+		{ scroll: 500, lastModified: 1000 },
+		{ scroll: 40, lastModified: 2000 }
+	);
+	assert.match(reason, /local timestamp newer/);
+});
+
+test('analyzeMergeForNote reports winner device', () => {
+	const r = analyzeMergeForNote([
+		{ sourceDeviceId: 'phone1', scroll: 500, lastModified: 3000, cursor: { from: { line: 88, ch: 0 }, to: { line: 88, ch: 0 } } },
+		{ sourceDeviceId: 'desk1', scroll: 40, lastModified: 5000, cursor: { from: { line: 0, ch: 0 }, to: { line: 0, ch: 0 } } },
+	]);
+	assert.equal(r.winnerDeviceId, 'desk1');
+	assert.equal(r.merged.scroll, 40);
 });
 
 test('findNearestHeadingLine finds heading above cursor', () => {

@@ -54,7 +54,9 @@ export function summarizeState(state: EphemeralState | null | undefined): Record
 		scroll: state.scroll,
 		cursorFrom: state.cursor?.from,
 		cursorTo: state.cursor?.to,
+		anchorLine: state.anchorLine,
 		lastModified: state.lastModified,
+		revision: state.revision,
 	};
 }
 
