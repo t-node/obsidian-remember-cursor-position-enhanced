@@ -1359,7 +1359,7 @@ export default class RememberCursorPosition extends Plugin {
 
 		// Prefer live editor position — lastEphemeralState can lag behind or hold a stale restore target.
 		const live = this.getEphemeralState();
-		const enriched = isValidState(live) ? this.enrichStateWithAnchor(live, fileName) : null;
+		const enriched = isValidState(live) ? this.enrichStateForSave(live, fileName) : null;
 		let st: EphemeralState;
 
 		if (enriched && isValidState(enriched)) {
@@ -1808,7 +1808,7 @@ export default class RememberCursorPosition extends Plugin {
 			return;
 		}
 
-		const enriched = this.enrichStateWithAnchor(st, fileName);
+		const enriched = this.enrichStateForSave(st, fileName);
 		if (!isEphemeralStatesEquals(enriched, this.lastEphemeralState)) {
 			this.logger.debug('STATE', 'State changed — queueing save', {
 				fileName,
@@ -2205,6 +2205,26 @@ export default class RememberCursorPosition extends Plugin {
 		return state;
 	}
 
+	getLineAtScrollTop(editor: Editor): number | null {
+		try {
+			const top = editor.getScrollInfo()?.top ?? 0;
+			const coords = (
+				editor as Editor & {
+					coordsChar?: (
+						coords: { left: number; top: number },
+						origin?: string
+					) => { line: number; ch: number };
+				}
+			).coordsChar?.({ left: 8, top: top + 24 }, 'local');
+			if (coords && typeof coords.line === 'number' && coords.line >= 0) {
+				return coords.line;
+			}
+		} catch {
+			// coordsChar unavailable in some view modes
+		}
+		return null;
+	}
+
 	enrichStateWithAnchor(st: EphemeralState, fileName: string): EphemeralState {
 		const editor = this.getEditor();
 		if (!editor || st.cursor == null) return st;
@@ -2215,6 +2235,37 @@ export default class RememberCursorPosition extends Plugin {
 		} catch {
 			return st;
 		}
+	}
+
+	/**
+	 * When the user scrolls without moving the caret (common on mobile), capture the
+	 * visible line so cross-device restore can jump to Q12 instead of line 0.
+	 */
+	enrichStateForSave(st: EphemeralState, fileName: string): EphemeralState {
+		const editor = this.getEditor();
+		if (!editor) return st;
+
+		let out = st;
+		if ((st.scroll ?? 0) > 20 && isWeakTopOfNoteState(st)) {
+			const visibleLine = this.getLineAtScrollTop(editor);
+			if (visibleLine != null && visibleLine > 0) {
+				out = {
+					...st,
+					cursor: {
+						from: { line: visibleLine, ch: 0 },
+						to: { line: visibleLine, ch: 0 },
+					},
+				};
+				this.logger.info('STATE', 'Captured visible line from scroll (caret was at top)', {
+					notePath: fileName,
+					scroll: st.scroll,
+					visibleLine,
+					platform: this.getDevicePlatformLabel(),
+				});
+			}
+		}
+
+		return this.enrichStateWithAnchor(out, fileName);
 	}
 
 	setEphemeralState(
@@ -2277,6 +2328,14 @@ export default class RememberCursorPosition extends Plugin {
 					retryMode.applyScroll(state.scroll!);
 				}
 			});
+		} else if (crossDevice && state.scroll != null && state.scroll > 20) {
+			this.logger.info('RESTORE', 'Cross-device scroll-only state — applying pixel scroll as fallback', {
+				remoteScroll: state.scroll,
+			});
+			const mode = view?.currentMode;
+			if (mode && typeof mode.applyScroll === 'function') {
+				mode.applyScroll(state.scroll);
+			}
 		} else if (crossDevice && state.scroll != null) {
 			this.logger.info('RESTORE', 'Cross-device restore — skipped pixel scroll (using line anchor)', {
 				remoteScroll: state.scroll,
