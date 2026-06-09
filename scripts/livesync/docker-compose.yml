@@ -14,7 +14,8 @@ services:
       COUCHDB_PASSWORD: ${COUCHDB_PASSWORD:-changeme}
     volumes:
       - couchdb-data:/opt/couchdb/data
-      - ./local.ini:/opt/couchdb/etc/local.d/livesync.ini:ro
+      # Do not mount local.d from /mnt/c — Windows filesystem blocks admin ini creation.
+      # CORS is applied via API in setup-livesync-wsl.sh after startup.
 
 volumes:
   couchdb-data:

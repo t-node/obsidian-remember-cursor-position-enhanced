@@ -27,6 +27,7 @@ import {
 	shouldWatchForRemoteState,
 	isOwnDeviceStateFile,
 	isDeviceStoreFileName,
+	getDeviceIdFromStorePath,
 	findNearestHeadingLine,
 	getAnchorLineFromState,
 } from './state-logic';
@@ -164,6 +165,8 @@ export default class RememberCursorPosition extends Plugin {
 	periodicFlushInterval: number | null = null;
 	ownDeviceStoreCache: DeviceStateStore | null = null;
 	remoteDeviceStoresCache = new Map<string, DeviceStateStore>();
+	/** Last seen storeRevision per remote device — detects LiveSync delivery without vault modify events. */
+	remoteStoreRevisionSnapshot = new Map<string, number>();
 
 	getLogDirPath(): string {
 		return LOG_DIR;
@@ -440,6 +443,7 @@ export default class RememberCursorPosition extends Plugin {
 			);
 
 			this.setupDOMEventListeners();
+			void this.seedRemoteStoreRevisionSnapshot();
 			this.applyPeriodicFlush();
 			void this.restoreCurrentNote();
 
@@ -1310,11 +1314,26 @@ export default class RememberCursorPosition extends Plugin {
 
 		// Prefer live editor position — lastEphemeralState can lag behind or hold a stale restore target.
 		const live = this.getEphemeralState();
-		const st = isValidState(live)
-			? { ...live, filePath: fileName, lastModified: Date.now() }
-			: isValidState(this.lastEphemeralState)
-				? this.lastEphemeralState
-				: live;
+		const enriched = isValidState(live) ? this.enrichStateWithAnchor(live, fileName) : null;
+		let st: EphemeralState;
+
+		if (enriched && isValidState(enriched)) {
+			if (
+				isValidState(this.lastEphemeralState) &&
+				isEphemeralStatesEquals(enriched, this.lastEphemeralState)
+			) {
+				this.logger.debug('FLUSH', 'flushCurrentNote skipped — scroll/cursor unchanged', {
+					notePath: fileName,
+					state: summarizeState(this.lastEphemeralState),
+				});
+				return;
+			}
+			st = { ...enriched, filePath: fileName, lastModified: Date.now() };
+		} else if (isValidState(this.lastEphemeralState)) {
+			st = this.lastEphemeralState;
+		} else {
+			st = live;
+		}
 
 		this.logger.info('FLUSH', 'flushCurrentNote', {
 			notePath: fileName,
@@ -1351,6 +1370,129 @@ export default class RememberCursorPosition extends Plugin {
 		this.debouncedSave(notePath, state);
 	}
 
+	async seedRemoteStoreRevisionSnapshot(): Promise<void> {
+		const ownId = this.settings.deviceId ?? 'unknown';
+		for (const filePath of await this.listDeviceStoreFiles()) {
+			const deviceId = getDeviceIdFromStorePath(filePath);
+			if (!deviceId || deviceId === ownId) continue;
+			try {
+				if (!(await this.app.vault.adapter.exists(filePath))) continue;
+				const raw = await this.app.vault.adapter.read(filePath);
+				const parsed = parseDeviceStoreJson(raw);
+				if (parsed) {
+					this.remoteStoreRevisionSnapshot.set(deviceId, parsed.storeRevision);
+				}
+			} catch {
+				// ignore unreadable remote store on startup
+			}
+		}
+	}
+
+	invalidateRemoteDeviceStoreCache(deviceId?: string): void {
+		if (deviceId) {
+			this.remoteDeviceStoresCache.delete(deviceId);
+			return;
+		}
+		this.remoteDeviceStoresCache.clear();
+	}
+
+	async tryApplyMergedStateForNote(
+		notePath: string,
+		trigger: string,
+		triggerFile?: string
+	): Promise<boolean> {
+		if (this.loadingFile || this.reloadingState) {
+			return false;
+		}
+		if (this.app.workspace.getActiveFile()?.path !== notePath) {
+			return false;
+		}
+
+		const merged = await this.readMergedNoteState(notePath);
+		if (!merged || !isValidState(merged)) {
+			this.logger.debug('SYNC', 'No valid merged state to apply', { notePath, trigger, triggerFile });
+			return false;
+		}
+
+		if (!shouldApplyMergedState(merged, this.lastEphemeralState)) {
+			this.logger.debug('SYNC', 'Merged state not applied', {
+				notePath,
+				trigger,
+				triggerFile,
+				incoming: summarizeState(merged),
+				applied: summarizeState(this.lastEphemeralState),
+			});
+			return false;
+		}
+
+		this.logger.info('SYNC', 'Applying newer merged state', {
+			notePath,
+			trigger,
+			triggerFile,
+			incomingTime: merged.lastModified ?? 0,
+			localTime: this.lastEphemeralState?.lastModified ?? 0,
+			sourceFileCount: (await this.listStateFilesForNote(notePath)).length,
+			state: summarizeState(merged),
+		});
+		await this.applyScrollState(notePath, merged, trigger);
+		return true;
+	}
+
+	async pollRemoteStateForActiveNote(trigger: string): Promise<void> {
+		const notePath = this.lastLoadedFileName;
+		if (!notePath || this.loadingFile || this.reloadingState) {
+			return;
+		}
+		if (Date.now() < this.restoreGraceUntil) {
+			return;
+		}
+
+		const ownId = this.settings.deviceId ?? 'unknown';
+		let remoteChanged = false;
+		for (const filePath of await this.listDeviceStoreFiles()) {
+			const deviceId = getDeviceIdFromStorePath(filePath);
+			if (!deviceId || deviceId === ownId) continue;
+
+			try {
+				if (!(await this.app.vault.adapter.exists(filePath))) continue;
+				const raw = await this.app.vault.adapter.read(filePath);
+				const parsed = parseDeviceStoreJson(raw);
+				if (!parsed) continue;
+
+				const prev = this.remoteStoreRevisionSnapshot.get(deviceId);
+				this.remoteStoreRevisionSnapshot.set(deviceId, parsed.storeRevision);
+				this.remoteDeviceStoresCache.set(deviceId, parsed);
+
+				if (prev != null && parsed.storeRevision !== prev) {
+					remoteChanged = true;
+					this.logger.info('SYNC', 'Remote device store revision changed (LiveSync/poll)', {
+						trigger,
+						deviceId,
+						filePath,
+						prevRevision: prev,
+						newRevision: parsed.storeRevision,
+						activeNote: notePath,
+					});
+				}
+			} catch (e) {
+				this.logger.warn('SYNC', 'Failed to poll remote device store', {
+					trigger,
+					filePath,
+					err: e instanceof Error ? e.message : String(e),
+				});
+			}
+		}
+
+		if (!remoteChanged) {
+			this.logger.debug('SYNC', 'Remote poll — no device store revision change', {
+				trigger,
+				notePath,
+			});
+		}
+
+		await this.tryApplyMergedStateForNote(notePath, trigger);
+	}
+
 	async handleExternalStateChange(stateFilePath: string) {
 		if (this.reloadingState) {
 			this.logger.debug('SYNC', 'External change skipped — already reloading', { stateFilePath });
@@ -1359,50 +1501,42 @@ export default class RememberCursorPosition extends Plugin {
 		this.reloadingState = true;
 
 		try {
-			const changed = await this.readStateFile(stateFilePath);
-			if (!changed?.filePath) {
-				this.logger.warn('SYNC', 'External state file missing filePath', { stateFilePath });
-				return;
-			}
+			const fileName = stateFilePath.split('/').pop() ?? '';
+			const remoteDeviceId = getDeviceIdFromStorePath(stateFilePath);
+			const isRemoteDeviceStore =
+				isDeviceStoreFileName(fileName) &&
+				remoteDeviceId != null &&
+				remoteDeviceId !== (this.settings.deviceId ?? 'unknown');
 
-			const notePath = changed.filePath;
-			const activeFile = this.app.workspace.getActiveFile()?.path;
-			if (activeFile !== notePath || this.loadingFile) {
-				this.logger.debug('SYNC', 'External change ignored — note not active', {
-					stateFilePath,
-					notePath,
+			if (isRemoteDeviceStore) {
+				this.invalidateRemoteDeviceStoreCache(remoteDeviceId);
+				await this.readStateFile(stateFilePath);
+				const activeFile = this.app.workspace.getActiveFile()?.path;
+				if (!activeFile || this.loadingFile) {
+					this.logger.debug('SYNC', 'Remote device store changed — no active note', {
+						stateFilePath,
+						remoteDeviceId,
+					});
+					return;
+				}
+				await this.tryApplyMergedStateForNote(
 					activeFile,
-					loadingFile: this.loadingFile,
+					'external-device-store',
+					stateFilePath
+				);
+				return;
+			}
+
+			const changed = await this.readStateFile(stateFilePath);
+			const notePath = changed?.filePath ?? this.app.workspace.getActiveFile()?.path;
+			if (!notePath) {
+				this.logger.warn('SYNC', 'External state change — could not resolve note path', {
+					stateFilePath,
 				});
 				return;
 			}
 
-			const merged = await this.readMergedNoteState(notePath);
-			if (!merged || !isValidState(merged)) {
-				this.logger.debug('SYNC', 'External change — no valid merged state', { stateFilePath, notePath });
-				return;
-			}
-
-			const incomingTime = merged.lastModified ?? 0;
-			const localTime = this.lastEphemeralState?.lastModified ?? 0;
-
-			if (shouldApplyMergedState(merged, this.lastEphemeralState)) {
-				this.logger.info('SYNC', 'Applying newer merged external state', {
-					notePath,
-					triggerFile: stateFilePath,
-					incomingTime,
-					localTime,
-					sourceFileCount: (await this.listStateFilesForNote(notePath)).length,
-					state: summarizeState(merged),
-				});
-				await this.applyScrollState(notePath, merged, 'external-sync');
-			} else {
-				this.logger.debug('SYNC', 'External change not applied', {
-					incomingTime,
-					localTime,
-					equal: isEphemeralStatesEquals(merged, this.lastEphemeralState),
-				});
-			}
+			await this.tryApplyMergedStateForNote(notePath, 'external-sync', stateFilePath);
 		} catch (e) {
 			this.logger.error('SYNC', 'Failed to handle external state change', e, { stateFilePath });
 		} finally {
@@ -1637,15 +1771,24 @@ export default class RememberCursorPosition extends Plugin {
 
 	applyPeriodicFlush(): void {
 		this.stopPeriodicFlush();
-		if (!this.settings.aggressiveCrossDeviceSync) return;
+		if (!this.settings.aggressiveCrossDeviceSync && !this.settings.reloadOnExternalChange) {
+			return;
+		}
+
+		const intervalMs = this.settings.aggressiveCrossDeviceSync
+			? AGGRESSIVE_PERIODIC_FLUSH_MS
+			: 3000;
 
 		this.periodicFlushInterval = window.setInterval(() => {
 			if (this.loadingFile || !this.lastLoadedFileName) return;
-			this.logger.debug('FLUSH', 'Periodic flush (aggressive sync)', {
-				notePath: this.lastLoadedFileName,
-			});
-			void this.flushCurrentNote(true);
-		}, AGGRESSIVE_PERIODIC_FLUSH_MS);
+			void this.pollRemoteStateForActiveNote('periodic-poll');
+			if (this.settings.aggressiveCrossDeviceSync) {
+				this.logger.debug('FLUSH', 'Periodic flush (aggressive sync)', {
+					notePath: this.lastLoadedFileName,
+				});
+				void this.flushCurrentNote(true);
+			}
+		}, intervalMs);
 	}
 
 	stopPeriodicFlush(): void {

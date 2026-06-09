@@ -1,7 +1,7 @@
 {
 	"id": "remember-cursor-position-enhanced",
 	"name": "Remember cursor position (Enhanced)",
-	"version": "2.1.0",
+	"version": "2.1.1",
 	"minAppVersion": "1.0.0",
 	"description": "Enhanced fork: per-note state files, cross-device sync, robust cursor and scroll memory",
 	"author": "Enhanced fork based on Dmitry Savosh",

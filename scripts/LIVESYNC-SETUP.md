@@ -27,29 +27,21 @@ LiveSync + RCP-E is **faster and lower overhead** than Syncthing + RCP-E for cur
 
 ---
 
-## Step 0 — Plugin v2.1.0 on master (desktop)
+## Step 0 — One script on master laptop
 
 ```powershell
 cd c:\obsidian-remember-cursor-position
-npm test
-npm run build
-npm run deploy
+powershell -ExecutionPolicy Bypass -File setup-livesync.ps1
 ```
 
-In Obsidian: **Ctrl+R**. Confirm Settings → RCP-E → State folder = `cursor-state`.
+You will be prompted for:
+- **CouchDB password** (8+ chars) — save it
+- **E2E passphrase** (8+ chars, same on all 4 devices) — save it
 
-Add to **Settings → Files & links → Excluded files:** `cursor-state/`
+The script deploys RCP-E, starts CouchDB, patches excluded files, and writes  
+`C:\notes1\LIVESYNC-NEXT-STEPS.txt` with your exact values.
 
----
-
-## Step 1 — CouchDB on master laptop
-
-```powershell
-cd c:\obsidian-remember-cursor-position\scripts
-.\setup-livesync-couchdb.ps1
-```
-
-Save the password. Database name: `obsidian-vault`.
+Then **Ctrl+R** in Obsidian and follow that file (steps A1–A8).
 
 ---
 

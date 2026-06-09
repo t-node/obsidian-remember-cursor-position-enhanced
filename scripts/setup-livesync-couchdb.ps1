@@ -38,7 +38,7 @@ if ($Password.Length -lt 8) {
 $env:COUCHDB_PASSWORD = $Password
 Push-Location $ComposeDir
 try {
-    docker compose up -d
+    docker compose up -d --force-recreate
     Write-Host "Waiting for CouchDB..." -ForegroundColor Cyan
     $ready = $false
     for ($i = 0; $i -lt 30; $i++) {
