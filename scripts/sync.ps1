@@ -5,9 +5,11 @@
   whose FIRST lines are a plain verdict: "ALL IN SYNC" or the exact issue(s) + fix.
 
 .DESCRIPTION
-  This is the only script you need to remember. It calls sync-360.ps1 (which itself runs the full
-  assurance + bidirectional + conflict + skew + storage checks), captures everything, and prepends a
-  TL;DR so a human or an AI sees the answer instantly without scrolling.
+  This is the only script you need to remember. It runs EVERYTHING and writes ONE report:
+    - sync-360.ps1: connections, same node, bidirectional push+pull probe, note parity, conflicts,
+      clock skew, storage, heartbeat (and -Minutes soak).
+    - sync-notes.ps1: PER-NOTE (node) check -- every note's position across all devices.
+  It captures all of it and prepends a TL;DR so a human or an AI sees the answer instantly.
 
   Output: debug-reports\SYNC-STATUS-<time>.txt  -> paste the whole thing to Claude/Copilot.
 
@@ -32,6 +34,12 @@ Write-Host "Running the full sync check (this takes a few minutes)..." -Foregrou
 $args360 = @('-ExecutionPolicy','Bypass','-File',(Join-Path $PSScriptRoot 'sync-360.ps1'))
 if ($Minutes -gt 0) { $args360 += @('-Minutes',$Minutes) }
 $full = & powershell @args360 2>&1 | ForEach-Object { $s = "$_"; Write-Host $s; $s }
+
+# Per-note ("node") check: confirm every note's reading position is consistent across all devices.
+Write-Host "`nRunning per-note (node) check..." -ForegroundColor Cyan
+$notesOut = & powershell -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'sync-notes.ps1') 2>&1 | ForEach-Object { $s = "$_"; Write-Host $s; $s }
+$noteSummary    = @($notesOut | Where-Object { $_ -match 'notes have devices recording DIFFERENT' }) | Select-Object -First 1
+$notesIdentical = [bool](@($notesOut | Where-Object { $_ -match 'same position on every device' }).Count)
 
 # ---- Build the TL;DR from sync-360's verdict ----
 $greenLine = @($full | Where-Object { $_ -match 'RESULT:\s*PERFECT SYNC|RESULT:\s*NOT YET' }) | Select-Object -First 1
@@ -64,6 +72,8 @@ if ($tier -eq 'GREEN') {
 }
 $tl.Add("")
 if ($greenLine) { $tl.Add("Green-light line: " + ($greenLine -replace '^\s*#?\s*','').Trim()) }
+if ($notesIdentical) { $tl.Add("Per-note (node) sync: cursor files identical on all reachable devices -> every note resolves to the same position on every device.") }
+if ($noteSummary) { $tl.Add("Per-note (node) sync: " + ($noteSummary.Trim())) }
 $tl.Add("")
 $tl.Add("## HOW TO USE THIS FILE")
 $tl.Add("  Paste this ENTIRE file to Claude or Copilot and ask:")
@@ -75,7 +85,16 @@ $tl.Add("  FULL CAPTURE BELOW")
 $tl.Add("==============================================================================")
 $tl.Add("")
 
-[System.IO.File]::WriteAllText($out, (($tl + $full) -join "`r`n"), $enc)
+# Assemble the single report: TL;DR + full 360 capture + the per-note (node) section.
+$body = New-Object System.Collections.Generic.List[string]
+($tl + $full) | ForEach-Object { $body.Add($_) }
+$body.Add("")
+$body.Add("==============================================================================")
+$body.Add("  PER-NOTE (NODE) CURSOR SYNC  -- every note's position across all devices")
+$body.Add("==============================================================================")
+$body.Add("")
+$notesOut | ForEach-Object { $body.Add($_) }
+[System.IO.File]::WriteAllText($out, ($body -join "`r`n"), $enc)
 
 Write-Host ""
 Write-Host "##############################################################################" -ForegroundColor Cyan
