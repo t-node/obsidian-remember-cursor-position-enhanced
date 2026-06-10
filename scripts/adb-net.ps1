@@ -18,12 +18,10 @@
 #>
 [CmdletBinding()]
 param([switch]$Doctor, [switch]$Enable)
+. "$PSScriptRoot\_sync-config.ps1"
 
-# Known Android devices (Tailscale IP). Add new devices here — one line each.
-$Devices = @(
-	@{ name = 'phone (vevins-s25)';  ip = '100.96.229.92' }
-	@{ name = 'tablet (vevins-tab-a9)'; ip = '100.93.19.49' }
-)
+# Android devices come from scripts\sync.config.ps1 (Tailscale IPs).
+$Devices = $SyncConfig.Devices | ForEach-Object { @{ name = $_.name; ip = $_.ip } }
 $Port = 5555
 
 if ($Enable) {

@@ -1,7 +1,17 @@
-import json, urllib.request, base64
+import json, urllib.request, base64, os
 
-base = 'http://127.0.0.1:5984/obsidian-vault/_local/obsydian_livesync_milestone'
-auth = base64.b64encode(b'obsidian:11111111').decode()
+# Credentials from env vars (never hardcode). Set before running, e.g.:
+#   PowerShell:  $env:COUCH_USER='obsidian'; $env:COUCH_PASS='...'
+#   bash:        COUCH_USER=obsidian COUCH_PASS=... python scripts/_unlock.py
+user = os.environ.get('COUCH_USER', 'obsidian')
+pw   = os.environ.get('COUCH_PASS')
+if not pw:
+    raise SystemExit('Set COUCH_PASS (and optionally COUCH_USER) env var before running.')
+db   = os.environ.get('COUCH_DB', 'obsidian-vault')
+host = os.environ.get('COUCH_URL', 'http://127.0.0.1:5984')
+
+base = f'{host}/{db}/_local/obsydian_livesync_milestone'
+auth = base64.b64encode(f'{user}:{pw}'.encode()).decode()
 
 def call(method, data=None):
     r = urllib.request.Request(base, data=data, method=method,

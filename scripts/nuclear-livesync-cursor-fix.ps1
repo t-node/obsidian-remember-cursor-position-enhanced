@@ -36,7 +36,7 @@
 param(
     [string]$VaultPath = 'C:\notes1',
     [string]$CouchUser = 'obsidian',
-    [string]$CouchPass = '11111111',
+    [string]$CouchPass,
     [string]$CouchUrl = 'http://127.0.0.1:5984',
     [string]$Database = 'obsidian-vault',
     [string]$PhoneDeviceId = 'hvmodycj',
@@ -48,6 +48,7 @@ param(
     [switch]$SkipCleanup,
     [string]$ReportDir = ''
 )
+. "$PSScriptRoot\_sync-config.ps1"
 
 $ErrorActionPreference = 'Continue'
 $RepoRoot = Split-Path $PSScriptRoot -Parent

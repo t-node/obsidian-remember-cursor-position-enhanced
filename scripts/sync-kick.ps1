@@ -24,24 +24,27 @@
 #>
 [CmdletBinding()]
 param([switch]$All, [switch]$NoRestart)
+. "$PSScriptRoot\_sync-config.ps1"
 
 $ErrorActionPreference = 'Continue'
 
 # Known Android devices: name / Tailscale IP / vault path. Add new devices here.
-$Devices = @(
-	@{ name = 'phone';  ip = '100.96.229.92'; vault = '/storage/emulated/0/Documents/Test' }
-	@{ name = 'tablet'; ip = '100.93.19.49';  vault = '/storage/emulated/0/ObsidianVault' }
-)
-$LaptopVault = 'C:\notes1'
+$Devices = $SyncConfig.Devices
+$LaptopVault = $SyncConfig.VaultDir
 $root = Split-Path $PSScriptRoot -Parent
 
 # Re-assert the known-good sync settings on a raw data.json string (idempotent, format-safe).
 function Set-SyncFields([string]$raw) {
-	$raw = $raw -replace '"liveSync":\s*(true|false)', '"liveSync": true'
+	# RELIABLE (batch) mode: liveSync OFF so the periodic fallback actually runs. The live
+	# connection dies over Tailscale and, while on, suppresses periodic — that was the recurring
+	# freeze. Instead: push on save, pull on note-open, and a 10s timer. Short reconnecting
+	# replications never get stuck the way one long-lived connection does.
+	$raw = $raw -replace '"liveSync":\s*(true|false)', '"liveSync": false'
 	$raw = $raw -replace '"syncOnStart":\s*(true|false)', '"syncOnStart": true'
 	$raw = $raw -replace '"syncOnSave":\s*(true|false)', '"syncOnSave": true'
+	$raw = $raw -replace '"syncOnFileOpen":\s*(true|false)', '"syncOnFileOpen": true'
 	$raw = $raw -replace '"periodicReplication":\s*(true|false)', '"periodicReplication": true'
-	$raw = $raw -replace '"periodicReplicationInterval":\s*\d+', '"periodicReplicationInterval": 30'
+	$raw = $raw -replace '"periodicReplicationInterval":\s*\d+', '"periodicReplicationInterval": 10'
 	$raw = $raw -replace '"writeLogToTheFile":\s*(true|false)', '"writeLogToTheFile": false'
 	$raw = $raw -replace '"useHistory":\s*(true|false)', '"useHistory": false'
 	$raw = $raw -replace '"skipOlderFilesOnSync":\s*(true|false)', '"skipOlderFilesOnSync": false'

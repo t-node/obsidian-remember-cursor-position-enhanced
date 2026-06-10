@@ -13,3 +13,11 @@ data.json
 cursor-positions.json
 scripts/livesync/.local-setup.json
 scripts/livesync/.env
+
+# generated sync diagnostics (machine/run specific) + stray local data
+debug-reports/
+_tb.json
+SYNC-STATUS-REPORT.md
+
+# local sync config with real credentials / device IPs -- NEVER commit
+scripts/sync.config.ps1

@@ -26,11 +26,11 @@
   verify      Same cross-device md5 comparison as doctor, plus a PASS/FAIL on whether
               every device's cursor-state files are byte-identical.
 
-.PARAMETER CouchUrl   Default http://127.0.0.1:5984
-.PARAMETER CouchUser  Default obsidian
-.PARAMETER CouchPass  Default 11111111
-.PARAMETER DbName     Default obsidian-vault
-.PARAMETER VaultDir   Laptop vault. Default C:\notes1
+.PARAMETER CouchUrl   From scripts\sync.config.ps1 (override to change)
+.PARAMETER CouchUser  From scripts\sync.config.ps1
+.PARAMETER CouchPass  From scripts\sync.config.ps1
+.PARAMETER DbName     From scripts\sync.config.ps1
+.PARAMETER VaultDir   Laptop vault, from scripts\sync.config.ps1
 .PARAMETER Yes        Skip the confirmation prompt on destructive actions (wipe).
 
 .EXAMPLE
@@ -45,13 +45,14 @@
 param(
 	[ValidateSet('doctor','backup','patch','wipe','unlock','verify')]
 	[string]$Action = 'doctor',
-	[string]$CouchUrl = 'http://127.0.0.1:5984',
-	[string]$CouchUser = 'obsidian',
-	[string]$CouchPass = '11111111',
-	[string]$DbName = 'obsidian-vault',
-	[string]$VaultDir = 'C:\notes1',
+	[string]$CouchUrl,
+	[string]$CouchUser,
+	[string]$CouchPass,
+	[string]$DbName,
+	[string]$VaultDir,
 	[switch]$Yes
 )
+. "$PSScriptRoot\_sync-config.ps1"
 
 $ErrorActionPreference = 'Stop'
 $DbUrl = "$CouchUrl/$DbName"
@@ -116,7 +117,7 @@ function Invoke-Doctor {
 	$live = @(); $ghost = @()
 	foreach ($n in $m.node_info.PSObject.Properties) {
 		$vault = $n.Value.vault_name
-		$tag = if ($vault -in @('notes1','Test','ObsidianVault')) { $live += $n.Name; 'LIVE ' } else { $ghost += $n.Name; 'ghost' }
+		$tag = if ($vault -in @('notes1','Test','ObsidianVault','Notes')) { $live += $n.Name; 'LIVE ' } else { $ghost += $n.Name; 'ghost' }
 		Write-Host ("  [{0}] {1,-12} vault='{2}'  last={3}" -f $tag, $n.Name, $vault, $n.Value.last_connected)
 	}
 	if ($ghost.Count) { Write-Host ("  ! {0} ghost node(s) -> 'unlock' action rewrites accepted_nodes to live only." -f $ghost.Count) -ForegroundColor Yellow }
@@ -173,8 +174,13 @@ function Patch-LiveSyncJson($json) {
 	$json.writeLogToTheFile = $false
 	$json.useHistory = $false
 	$json.skipOlderFilesOnSync = $false
-	$json.liveSync = $true
+	# RELIABLE (batch) mode — liveSync OFF so the periodic fallback runs (see sync-kick.ps1).
+	$json.liveSync = $false
 	$json.syncOnStart = $true
+	$json.syncOnSave = $true
+	$json.syncOnFileOpen = $true
+	$json.periodicReplication = $true
+	$json.periodicReplicationInterval = 10
 	$json.automaticallyDeleteMetadataOfDeletedFiles = 7
 	$json.syncIgnoreRegEx = $GoodSyncIgnoreRegEx
 	return $json
@@ -232,7 +238,7 @@ function Invoke-Unlock {
 	$m = Couch GET $MilestoneId
 	$live = @()
 	foreach ($n in $m.node_info.PSObject.Properties) {
-		if ($n.Value.vault_name -in @('notes1','Test','ObsidianVault')) { $live += $n.Name }
+		if ($n.Value.vault_name -in @('notes1','Test','ObsidianVault','Notes')) { $live += $n.Name }
 	}
 	$live = $live | Sort-Object -Unique
 	$m.locked = $false

@@ -39,7 +39,7 @@
 param(
     [string]$VaultPath = 'C:\notes1',
     [string]$CouchUser = 'obsidian',
-    [string]$CouchPass = '11111111',
+    [string]$CouchPass,
     [string]$CouchUrl = 'http://127.0.0.1:5984',
     [string]$Database = 'obsidian-vault',
     [string]$PhoneDeviceId = 'hvmodycj',
@@ -53,6 +53,7 @@ param(
     [int]$RebuildTimeoutMinutes = 90,
     [string]$ReportDir = ''
 )
+. "$PSScriptRoot\_sync-config.ps1"
 
 $ErrorActionPreference = 'Continue'
 $RepoRoot = Split-Path $PSScriptRoot -Parent
@@ -443,7 +444,7 @@ LAPTOP (do now if not using -WaitForRebuild):
   2. LiveSync detects redflag2.md → rebuilds local + remote from your ~10 MB vault
   3. Wait until log quiet (often 5–30 min for small vault)
   4. Verify CouchDB size:
-     `$h = @{ Authorization = "Basic " + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("obsidian:11111111")) }
+     `$h = @{ Authorization = "Basic " + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("obsidian:YOUR_PASSWORD")) }
      (Invoke-RestMethod -Uri "http://127.0.0.1:5984/obsidian-vault" -Headers `$h).doc_count
      Expect: hundreds–low thousands, NOT 32878
   5. Delete C:\notes1\redflag2.md when done
