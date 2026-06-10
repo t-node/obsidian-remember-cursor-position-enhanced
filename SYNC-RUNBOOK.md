@@ -11,11 +11,12 @@ forever, across any number of devices. Everything here is driven by **one script
 - **RCP-E** (the plugin) saves each device's reading position to `cursor-state/{deviceId}.json`.
   Each device writes **only its own** file. On note-open it merges all device files and restores
   the newest position. Single-writer files = **structurally impossible to conflict**.
-- **LiveSync → CouchDB** (on the laptop) is just the *pipe* that copies those files between devices.
+- **LiveSync → CouchDB** (on the laptop) is just the _pipe_ that copies those files between devices.
 - **The laptop (`C:\notes1`) is always the source of truth.** Every reset re-uploads the laptop
   and every other device fetches it. Never the other way around.
 
 Two things, and only two, must be true for sync to work:
+
 1. The pipe delivers `cursor-state/*.json` (CouchDB lean, unlocked, all real nodes accepted).
 2. The merge picks the right position (handled in plugin code — see "The snap-back fix" below).
 
@@ -28,6 +29,7 @@ pwsh scripts/sync-reset.ps1 -Action doctor
 ```
 
 Auto-discovers every connected adb device (phone/tablet) + the laptop and reports:
+
 - CouchDB size + lock state + any **ghost nodes** (dead vault identities).
 - A per-file **md5 comparison** of `cursor-state/*.json` across **all** devices.
   `OK` = byte-identical everywhere. `DIFF` = that file hasn't propagated → the pipe is stuck.
@@ -119,6 +121,7 @@ Symptom: "I scroll down, it jumps back to the top / a default position from some
 
 Cause: a stale remote position with a skewed-newer wall-clock used to override your live scroll.
 Fixed in code (no settings needed):
+
 - **Active-reading guard** (`main.ts`): while you're touching a note, no remote position can
   override it for `ACTIVE_INTERACTION_GUARD_MS` (10s) after your last move. Uses the local clock
   only, so cross-device clock skew can't defeat it.
@@ -141,3 +144,25 @@ If it ever recurs, grab the losing device's `rcp-enhanced-logs/{id}.log` and sea
   reinstall Obsidian, then **Fetch**.
 - Keep `useHistory:false`, `writeLogToTheFile:false`, and the full `syncIgnoreRegEx` on **every**
   device. `-Action patch` enforces this everywhere in one shot.
+
+If sync ever seems stuck — run ONE thing
+
+pwsh scripts/sync-kick.ps1
+That's your "reboot it" button. Over Tailscale (no USB, no cables), it: reconnects to the phone + tablet → re-asserts the correct settings → restarts their sync → shows you the health check. Then just glance at a note on each phone/tablet for a few seconds. Done — usually ~40 seconds total.
+
+If the laptop itself seems stuck too, add -All:
+
+pwsh scripts/sync-kick.ps1 -All
+Your whole cheat sheet (only 4 commands, ever)
+Situation Command
+Sync stuck / paused pwsh scripts/sync-kick.ps1
+Just checking — is everything in sync? pwsh scripts/adb-net.ps1 -Doctor
+Phone/tablet was rebooted (adb won't connect) USB once → pwsh scripts/adb-net.ps1 -Enable → unplug
+Deep corruption (chunk errors / GB bloat — rare) open SYNC-RUNBOOK.md, run the reset section
+All committed and documented in SYNC-RUNBOOK.md, so it's never lost.
+
+What "normal" looks like now
+You shouldn't even need the button most days. With syncOnSave + 30-second periodic on all three devices, the everyday experience is: scroll on one device → it shows up on the others within a few seconds (and a backgrounded phone/tablet catches up the moment you open it). The kick button is just insurance for the rare hiccup — the equivalent of restarting an app that misbehaved.
+
+Why it kept happening before (so you trust it's actually fixed)
+The real culprit, underneath all the symptoms, was that the continuous live connection doesn't survive over Tailscale — and your config had no fallback, so any drop = silent freeze until a restart. That's now fixed at the root on every device (push-on-save + pull-every-30s), which is why this round is different from all the previous attempts.
