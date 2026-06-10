@@ -38,7 +38,24 @@ config. Each device also keeps its **own** logs (`rcp-enhanced-logs/{deviceId}.l
 
 ---
 
-## 2. The reset (when sync is stuck or bloated)
+## 1b. Sync stuck / paused? — THE ONE-COMMAND FIX (use this 99% of the time)
+
+This is your "reboot it" button. No USB. It reconnects to the phone + tablet over Tailscale,
+re-asserts the correct sync settings, restarts their Obsidian so replication re-establishes,
+and prints the health check so you can watch it converge.
+
+```powershell
+pwsh scripts/sync-kick.ps1          # fix phone + tablet, verify
+pwsh scripts/sync-kick.ps1 -All     # ALSO restart the laptop's Obsidian
+```
+
+It does NOT touch CouchDB or your notes — only wakes the sync. After it runs, **glance at a note
+on each phone/tablet for a few seconds** (mobile only syncs in the foreground). That's it.
+
+After a phone/tablet **reboot**, wireless adb resets — plug it into USB once and run
+`pwsh scripts/adb-net.ps1 -Enable`, then unplug. Cable-free again.
+
+## 2. The deep reset (RARE — only for chunk errors / bloat, not normal stalls)
 
 This is the **"reset everything to a clean slate"** procedure. It reclaims all CouchDB bloat and
 unifies every device onto one fresh document lineage (the thing that fixes "device X won't push").
