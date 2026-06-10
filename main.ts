@@ -76,6 +76,8 @@ const AGGRESSIVE_SAVE_DEBOUNCE_MS = 150;
 const AGGRESSIVE_PERIODIC_FLUSH_MS = 2000;
 const RESTORE_FALLBACK_MS = 350;
 const RESTORE_GRACE_MS = 2000;
+/** While the user has touched the active note within this window, remote states won't override it. */
+const ACTIVE_INTERACTION_GUARD_MS = 10000;
 const SYNC_RETRY_RESTORE_MS = 3000;
 const AGGRESSIVE_SYNC_RETRY_RESTORE_MS = 1500;
 const CROSS_DEVICE_SYNC_WATCH_MS = 60000;
@@ -159,6 +161,8 @@ export default class RememberCursorPosition extends Plugin {
 	pendingSavePath: string | null = null;
 	pendingSaveState: EphemeralState | null = null;
 	restoreGraceUntil = 0;
+	/** Local-clock timestamp of the last genuine user scroll/cursor move on the active note. */
+	lastLocalInteractionAt = 0;
 	crossDeviceSyncWatchUntil = new Map<string, number>();
 	syncRetryRestoreTimers: number[] = [];
 	pluginUpdateNoticeShown = false;
@@ -1522,6 +1526,30 @@ export default class RememberCursorPosition extends Plugin {
 			return false;
 		}
 
+		// Active-reading guard (skew-proof, local clock only): if the user has scrolled/moved on
+		// THIS note within the guard window, a remote device's position must not yank it away.
+		// Note-open restores use a different path (restoreNoteState), so first-open is unaffected.
+		const guardWinnerId = this.lastMergeAnalysis?.winnerDeviceId ?? null;
+		const guardOwnId = this.settings.deviceId ?? 'unknown';
+		const sinceInteraction = Date.now() - this.lastLocalInteractionAt;
+		if (
+			guardWinnerId != null &&
+			guardWinnerId !== guardOwnId &&
+			sinceInteraction < ACTIVE_INTERACTION_GUARD_MS
+		) {
+			this.logger.info('SYNC', 'Merged state held — user actively reading this note', {
+				notePath,
+				trigger,
+				triggerFile,
+				winnerDeviceId: guardWinnerId,
+				sinceInteractionMs: sinceInteraction,
+				guardWindowMs: ACTIVE_INTERACTION_GUARD_MS,
+				incoming: summarizeState(merged),
+				applied: summarizeState(this.lastEphemeralState),
+			});
+			return false;
+		}
+
 		if (!shouldApplyMergedState(merged, this.lastEphemeralState)) {
 			const reason = explainApplyRejection(merged, this.lastEphemeralState);
 			const editorNow = summarizeState(this.getEphemeralState());
@@ -1816,6 +1844,7 @@ export default class RememberCursorPosition extends Plugin {
 				previous: summarizeState(this.lastEphemeralState),
 				current: summarizeState(enriched),
 			});
+			this.lastLocalInteractionAt = Date.now();
 			this.lastEphemeralState = { ...enriched, filePath: fileName, lastModified: Date.now() };
 			this.queueSave(fileName, this.lastEphemeralState);
 		}

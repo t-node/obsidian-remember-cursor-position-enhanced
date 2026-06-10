@@ -19,6 +19,15 @@ export interface TaggedNoteState extends EphemeralState {
 /** Wall-clock skew threshold (ms) before logging a suspected fast/slow device clock. */
 export const CLOCK_SKEW_LOG_THRESHOLD_MS = 120_000;
 
+/**
+ * Scroll values within this many units are treated as the SAME position. Cross-device
+ * restores land a fraction of a line off (e.g. 211.39 vs 210.96); without this tolerance the
+ * tiny difference reads as a "new scroll", gets re-saved with a fresh timestamp, and bounces
+ * between devices forever — the note appears stuck at one position ("always Q11"). Sub-line, so
+ * imperceptible to the reader.
+ */
+export const SCROLL_EQ_EPSILON = 2;
+
 export function getFileHash(filePath: string): string {
 	let hash1 = 0;
 	let hash2 = 0;
@@ -120,7 +129,7 @@ export function isEphemeralStatesEquals(state1: EphemeralState, state2: Ephemera
 		// both absent
 	} else if (scroll1 == null || scroll2 == null) {
 		return false;
-	} else if (scroll1 !== scroll2) {
+	} else if (Math.abs(scroll1 - scroll2) > SCROLL_EQ_EPSILON) {
 		return false;
 	}
 
@@ -310,6 +319,14 @@ export function shouldApplyMergedState(
 	if (isEphemeralStatesEquals(disk, applied)) return false;
 
 	const diskScroll = disk.scroll ?? 0;
+	const appliedScroll = applied.scroll ?? 0;
+
+	// Clock-skew-proof guard: a weak top-of-note / "default" incoming state must NEVER
+	// override a substantial existing reading position, even if its wall-clock looks newer.
+	// This is the root of the "I scroll down, it snaps back to the top" symptom.
+	if (appliedScroll > 20 && isWeakTopOfNoteState(disk) && !isWeakTopOfNoteState(applied)) {
+		return false;
+	}
 
 	if (diskScroll > 20 && isWeakDefaultScrollSave(applied, disk)) {
 		return true;
@@ -414,6 +431,10 @@ export function explainApplyRejection(
 	if (isEphemeralStatesEquals(disk, applied)) return 'already equal to editor state';
 
 	const diskScroll = disk.scroll ?? 0;
+	const appliedScroll = applied.scroll ?? 0;
+	if (appliedScroll > 20 && isWeakTopOfNoteState(disk) && !isWeakTopOfNoteState(applied)) {
+		return 'held — incoming is weak top-of-note over a substantial local position';
+	}
 	if (diskScroll > 20 && isWeakDefaultScrollSave(applied, disk)) {
 		return 'would apply (weak local top-of-note vs remote scroll)';
 	}

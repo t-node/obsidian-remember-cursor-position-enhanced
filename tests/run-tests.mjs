@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 
 // Mirrors state-logic.ts — kept inline so tests run with plain Node (no Obsidian runtime).
+const SCROLL_EQ_EPSILON = 2;
+
 function getFileHash(filePath) {
 	let hash1 = 0;
 	let hash2 = 0;
@@ -112,6 +114,7 @@ function shouldApplyMergedState(disk, applied) {
 	if (isEphemeralStatesEquals(disk, applied)) return false;
 	const diskScroll = disk.scroll ?? 0;
 	const appliedScroll = applied.scroll ?? 0;
+	if (appliedScroll > 20 && isWeakTopOfNoteState(disk) && !isWeakTopOfNoteState(applied)) return false;
 	if (diskScroll > 20 && isWeakDefaultScrollSave(applied, disk)) return true;
 	if ((applied.lastModified ?? 0) > (disk.lastModified ?? 0)) return false;
 	if ((disk.lastModified ?? 0) > (applied.lastModified ?? 0)) return true;
@@ -141,7 +144,7 @@ function isEphemeralStatesEquals(state1, state2) {
 		// both absent
 	} else if (scroll1 == null || scroll2 == null) {
 		return false;
-	} else if (scroll1 !== scroll2) {
+	} else if (Math.abs(scroll1 - scroll2) > SCROLL_EQ_EPSILON) {
 		return false;
 	}
 	return true;
@@ -417,6 +420,48 @@ test('shouldApplyMergedState does not yank scroll when editor is newer', () => {
 			{ scroll: 130, lastModified: 2000 }
 		),
 		false
+	);
+});
+
+test('isEphemeralStatesEquals treats sub-line scroll drift as equal (echo-loop fix)', () => {
+	// The "always Q11" bug: cross-device restore lands 211.39 vs 210.96 — must read as SAME,
+	// otherwise it re-saves with a fresh timestamp and bounces between devices forever.
+	assert.equal(
+		isEphemeralStatesEquals(
+			{ scroll: 211.3937, cursor: { from: { line: 0, ch: 0 }, to: { line: 0, ch: 0 } } },
+			{ scroll: 210.9573, cursor: { from: { line: 0, ch: 0 }, to: { line: 0, ch: 0 } } }
+		),
+		true
+	);
+	// A real scroll away (many lines) is still a change.
+	assert.equal(
+		isEphemeralStatesEquals(
+			{ scroll: 211, cursor: { from: { line: 0, ch: 0 }, to: { line: 0, ch: 0 } } },
+			{ scroll: 169, cursor: { from: { line: 0, ch: 0 }, to: { line: 0, ch: 0 } } }
+		),
+		false
+	);
+});
+
+test('shouldApplyMergedState rejects weak top-of-note even with newer remote clock (snap-back fix)', () => {
+	// Remote "default" (scroll 0, caret origin) with a SKEWED-newer wall clock must NOT
+	// override a real reading position. This is the "scroll keeps resetting to top" bug.
+	assert.equal(
+		shouldApplyMergedState(
+			{ scroll: 2, lastModified: 9999, cursor: { from: { line: 0, ch: 0 }, to: { line: 0, ch: 0 } } },
+			{ scroll: 340, lastModified: 1000, cursor: { from: { line: 88, ch: 0 }, to: { line: 88, ch: 0 } } }
+		),
+		false
+	);
+});
+
+test('shouldApplyMergedState still applies a real remote position over weak local', () => {
+	assert.equal(
+		shouldApplyMergedState(
+			{ scroll: 340, lastModified: 5000, cursor: { from: { line: 88, ch: 0 }, to: { line: 88, ch: 0 } } },
+			{ scroll: 2, lastModified: 1000, cursor: { from: { line: 0, ch: 0 }, to: { line: 0, ch: 0 } } }
+		),
+		true
 	);
 });
 
