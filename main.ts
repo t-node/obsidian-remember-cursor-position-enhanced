@@ -498,7 +498,8 @@ export default class RememberCursorPosition extends Plugin {
 				platform: this.getDevicePlatformLabel(),
 				perDeviceState: true,
 			});
-			this.showLoadNotice();
+			// No startup popup — it's pure noise on every launch. Use the "Show plugin version"
+			// command if you ever want to check the version/device id on demand.
 			await this.logger.flushToFile();
 		} catch (e) {
 			const msg = e instanceof Error ? e.message : String(e);
