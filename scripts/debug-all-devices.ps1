@@ -34,7 +34,7 @@ $ErrorActionPreference = 'Continue'
 . "$PSScriptRoot\_sync-config.ps1"
 
 $Repo        = Split-Path $PSScriptRoot -Parent
-$DestRoot    = Join-Path $VaultDir 'sync-health'
+$DestRoot    = Join-Path $Repo 'debug-reports\history\pulled-health'   # NOT the synced vault — avoids LiveSync merge conflicts
 $RcpDestRoot = Join-Path $Repo 'debug-reports\device-rcp-logs'
 New-Item -ItemType Directory -Force -Path $DestRoot, $RcpDestRoot | Out-Null
 

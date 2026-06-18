@@ -355,24 +355,30 @@ function Invoke-Analyze {
     # ---- ON-DEVICE HEALTH LOGS (sync-health/, written BY each device — sees what home cannot) ----
     W ""
     W "## ON-DEVICE HEALTH LOGS (sync-health/ — each device's own view, incl. while away from home)"
-    $healthDir = Join-Path $VaultDir 'sync-health'
-    if (-not (Test-Path $healthDir)) {
-        W "   none yet at $healthDir (plugin v2.2.0+ writes these; they arrive when the device syncs, or via -PullHealth)"
-    } else {
-        $hrows = @()
-        Get-ChildItem -Path $healthDir -Recurse -Filter *.jsonl -ErrorAction SilentlyContinue | ForEach-Object {
+    # Read on-device health from BOTH the synced vault copy AND the adb-pulled rescue archive.
+    # Pulls land in debug-reports\history\pulled-health (NOT the vault), so the master is never a
+    # 2nd writer of a device's synced log file -> no more LiveSync "merge" conflicts/notifications.
+    $healthDirs = @((Join-Path $VaultDir 'sync-health'), (Join-Path $HistDir 'pulled-health'))
+    $hrows = @(); $seenHrow = @{}
+    foreach ($hd in $healthDirs) {
+        if (-not (Test-Path $hd)) { continue }
+        Get-ChildItem -Path $hd -Recurse -Filter *.jsonl -ErrorAction SilentlyContinue | ForEach-Object {
             foreach ($l in (Get-Content $_.FullName -Encoding utf8)) {
                 if (-not $l.Trim()) { continue }
                 try { $o = $l | ConvertFrom-Json } catch { continue }
                 if (-not $o.tsEpoch) { continue }
                 $sec = [int64][math]::Floor([double]$o.tsEpoch / 1000)
                 if ($sec -lt $cutoff) { continue }
+                $dk = "$($o.deviceId)|$($o.tsEpoch)"
+                if ($seenHrow.ContainsKey($dk)) { continue }   # dedupe vault vs pulled copy
+                $seenHrow[$dk] = $true
                 $o | Add-Member -NotePropertyName tsUtc -NotePropertyValue $sec -Force
                 $hrows += $o
             }
         }
-        if ($hrows.Count -eq 0) { W "   no health samples in window." }
-        else {
+    }
+    if ($hrows.Count -eq 0) { W "   no on-device health samples in window (heartbeat writes these; arrive via sync or -PullHealth)." }
+    else {
             $byDev = $hrows | Group-Object { if ($_.deviceName) { $_.deviceName } else { $_.deviceId } }
             foreach ($g in ($byDev | Sort-Object Name)) {
                 $rs = $g.Group | Sort-Object tsUtc
@@ -415,7 +421,6 @@ function Invoke-Analyze {
                 }
             }
         }
-    }
 
     # ---- verdict ----
     W ""
@@ -495,13 +500,13 @@ function Invoke-Uninstall {
     catch { Write-Host "No task '$TaskName' to remove (or removal failed): $($_.Exception.Message)" -ForegroundColor Yellow }
 }
 
-# Pull each reachable device's on-device sync-health logs straight into the master vault's sync-health/.
-# Use this when a device was away with BROKEN sync (so its health logs never replicated home) — connect it
-# (USB or wireless adb) and run this to bring the logs home, then -Analyze sees them.
+# Pull each reachable device's on-device sync-health logs into a LOCAL archive (debug-reports), NOT the
+# synced vault — so the master never becomes a 2nd writer of a device's synced log file (which caused
+# LiveSync "merge" conflicts/notifications). Use when sync is broken; -Analyze reads this + the vault copy.
 function Invoke-PullHealth {
     $adb = Resolve-Adb
     if (-not $adb) { Write-Host "adb not found." -ForegroundColor Red; return }
-    $destRoot = Join-Path $VaultDir 'sync-health'
+    $destRoot = Join-Path $HistDir 'pulled-health'
     New-Item -ItemType Directory -Force -Path $destRoot | Out-Null
     # Best-effort: wake configured wireless devices (USB devices already show in 'adb devices').
     foreach ($d in $Devices) { & $adb connect "$($d.ip):5555" 2>&1 | Out-Null }
