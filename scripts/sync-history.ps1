@@ -36,6 +36,7 @@ param(
     [switch]$Analyze,
     [switch]$Install,
     [switch]$Uninstall,
+    [switch]$PullHealth,
     [int]$IntervalMinutes = 30,
     [int]$SinceDays = 0,
     [string]$CouchUrl,[string]$CouchUser,[string]$CouchPass,[string]$DbName,[string]$VaultDir
@@ -322,6 +323,55 @@ function Invoke-Analyze {
         if ($sk.Count) { $mx=($sk|ForEach-Object{[math]::Abs($_)}|Measure-Object -Maximum).Maximum; W ("   {0,-10} max |skew| {1}s over {2} sample(s)" -f $dn,$mx,$sk.Count); if($mx -gt 30){$verdict+="$dn clock skew up to ${mx}s (can make the wrong cursor position win)"} }
     }
 
+    # ---- ON-DEVICE HEALTH LOGS (sync-health/, written BY each device — sees what home cannot) ----
+    W ""
+    W "## ON-DEVICE HEALTH LOGS (sync-health/ — each device's own view, incl. while away from home)"
+    $healthDir = Join-Path $VaultDir 'sync-health'
+    if (-not (Test-Path $healthDir)) {
+        W "   none yet at $healthDir (plugin v2.2.0+ writes these; they arrive when the device syncs, or via -PullHealth)"
+    } else {
+        $hrows = @()
+        Get-ChildItem -Path $healthDir -Recurse -Filter *.jsonl -ErrorAction SilentlyContinue | ForEach-Object {
+            foreach ($l in (Get-Content $_.FullName -Encoding utf8)) {
+                if (-not $l.Trim()) { continue }
+                try { $o = $l | ConvertFrom-Json } catch { continue }
+                if (-not $o.tsEpoch) { continue }
+                $sec = [int64][math]::Floor([double]$o.tsEpoch / 1000)
+                if ($sec -lt $cutoff) { continue }
+                $o | Add-Member -NotePropertyName tsUtc -NotePropertyValue $sec -Force
+                $hrows += $o
+            }
+        }
+        if ($hrows.Count -eq 0) { W "   no health samples in window." }
+        else {
+            $byDev = $hrows | Group-Object { if ($_.deviceName) { $_.deviceName } else { $_.deviceId } }
+            foreach ($g in ($byDev | Sort-Object Name)) {
+                $rs = $g.Group | Sort-Object tsUtc
+                W ("   {0}  ({1} samples, {2} -> {3})" -f $g.Name, $rs.Count, (Fmt $rs[0].tsUtc), (Fmt $rs[-1].tsUtc))
+                # offline windows as the DEVICE itself saw them
+                $offRuns = Get-FalseRuns $rs { param($r) $r.online -eq $false }
+                foreach ($r in ($offRuns | Select-Object -Last 6)) { W ("        OFFLINE (self-reported) {0}  ({1} -> {2})" -f (Dur $r.dur),(Fmt $r.from),(Fmt $r.to)); $verdict += "$($g.Name) self-reported offline $(Dur $r.dur) (captured on-device)" }
+                # could-not-reach-CouchDB while having a network (server/Tailscale issue, not the device's wifi)
+                $probeRuns = Get-FalseRuns $rs { param($r) $r.couchProbe -and ($r.couchProbe.reachable -eq $false) -and ($r.online -eq $true) }
+                foreach ($r in ($probeRuns | Select-Object -Last 6)) { W ("        ONLINE but COUCHDB UNREACHABLE {0}  ({1} -> {2})" -f (Dur $r.dur),(Fmt $r.from),(Fmt $r.to)); $verdict += "$($g.Name) had network but could NOT reach CouchDB for $(Dur $r.dur) (server/Tailscale, not device wifi)" }
+                # LiveSync trigger flag flips, as recorded ON the device (catches the reset even while away)
+                $keys = 'liveSync','syncOnSave','syncOnStart','periodicReplication','syncOnFileOpen'
+                $withFlags = $rs | Where-Object { $_.livesync }
+                for ($i=1; $i -lt $withFlags.Count; $i++) {
+                    foreach ($k in $keys) {
+                        $ov = $withFlags[$i-1].livesync.$k; $nv = $withFlags[$i].livesync.$k
+                        if ($null -ne $ov -and $null -ne $nv -and [bool]$ov -ne [bool]$nv) { W ("        flag {0}: {1} -> {2}  at {3}" -f $k,$ov,$nv,(Fmt $withFlags[$i].tsUtc)); $verdict += "$($g.Name) LiveSync flag '$k' flipped to $nv (on-device record)" }
+                    }
+                }
+                if ($withFlags.Count) {
+                    $lf = $withFlags[-1].livesync
+                    $allOff = -not ($keys | Where-Object { [bool]$lf.$_ })
+                    if ($allOff) { W "        latest flags: ALL triggers OFF (won't replicate on its own)" }
+                }
+            }
+        }
+    }
+
     # ---- verdict ----
     W ""
     W ("=" * 78)
@@ -391,9 +441,40 @@ function Invoke-Uninstall {
     catch { Write-Host "No task '$TaskName' to remove (or removal failed): $($_.Exception.Message)" -ForegroundColor Yellow }
 }
 
+# Pull each reachable device's on-device sync-health logs straight into the master vault's sync-health/.
+# Use this when a device was away with BROKEN sync (so its health logs never replicated home) — connect it
+# (USB or wireless adb) and run this to bring the logs home, then -Analyze sees them.
+function Invoke-PullHealth {
+    $adb = Resolve-Adb
+    if (-not $adb) { Write-Host "adb not found." -ForegroundColor Red; return }
+    $destRoot = Join-Path $VaultDir 'sync-health'
+    New-Item -ItemType Directory -Force -Path $destRoot | Out-Null
+    $total = 0
+    foreach ($d in $Devices) {
+        $serial = "$($d.ip):5555"
+        if ((& $adb connect $serial 2>&1 | Select-Object -Last 1) -notmatch 'connected') { Write-Host "  $($d.name): not reachable over wireless adb (skip)" -ForegroundColor Yellow; continue }
+        $base = "$($d.vault)/sync-health"
+        $files = (& $adb -s $serial shell "find '$base' -type f -name '*.jsonl' 2>/dev/null" 2>$null) | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+        $n = 0
+        foreach ($f in $files) {
+            $rel = $f.Substring($base.Length).TrimStart('/')
+            $dest = Join-Path $destRoot ($rel -replace '/','\')
+            New-Item -ItemType Directory -Force -Path (Split-Path $dest -Parent) | Out-Null
+            & $adb -s $serial pull "$f" "$dest" 2>$null | Out-Null
+            if (Test-Path $dest) { $n++ }
+        }
+        Write-Host ("  {0}: pulled {1} health file(s)" -f $d.name, $n) -ForegroundColor Green
+        $total += $n
+    }
+    & $adb disconnect 2>$null | Out-Null
+    Write-Host ("Pulled {0} on-device health file(s) -> {1}" -f $total, $destRoot) -ForegroundColor Green
+    Write-Host "Now run:  pwsh scripts\sync-history.ps1 -Analyze" -ForegroundColor Gray
+}
+
 # ============================================================ DISPATCH ============================================================
-if ($Install)   { Invoke-Install; return }
-if ($Uninstall) { Invoke-Uninstall; return }
-if ($Analyze)   { Invoke-Analyze; return }
+if ($Install)    { Invoke-Install; return }
+if ($Uninstall)  { Invoke-Uninstall; return }
+if ($PullHealth) { Invoke-PullHealth; return }
+if ($Analyze)    { Invoke-Analyze; return }
 $script:PrevSnap = Read-LastSnapshot   # capture BEFORE writing the new line, for transition diff
 Invoke-Snapshot | Out-Null

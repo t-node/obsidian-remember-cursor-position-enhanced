@@ -1,6 +1,6 @@
 {
   "name": "obsidian-remember-cursor-position",
-  "version": "2.1.7",
+  "version": "2.2.0",
   "description": "Remember cursor and scroll position for each note",
   "main": "main.js",
   "scripts": {

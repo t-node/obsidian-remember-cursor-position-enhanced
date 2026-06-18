@@ -11,6 +11,7 @@ import {
 	debounce,
 	Debouncer,
 	Notice,
+	requestUrl,
 } from 'obsidian';
 import {
 	EphemeralState,
@@ -67,6 +68,14 @@ interface PluginSettings {
 	deviceId?: string;
 	/** Minimize save delay + periodic flush for fastest practical cross-device sync */
 	aggressiveCrossDeviceSync: boolean;
+	/** Periodically record THIS device's own sync health into sync-health/ so a remote/offline device's
+	 *  problems are captured on-device and come home (via sync, or a later USB/adb pull) for diagnosis. */
+	healthHeartbeat: boolean;
+	/** Minutes between health snapshots (each is tiny; daily-rotated file). */
+	healthIntervalMin: number;
+	/** Optional URL to probe for "could this device reach CouchDB right now" (e.g. the Tailscale Serve URL
+	 *  + db, like https://host.ts.net/obsidian-vault). Any HTTP status (even 401) counts as reachable. */
+	couchHealthProbeUrl: string;
 	/** @deprecated migrated to stateDir */
 	dbFileName?: string;
 }
@@ -97,9 +106,16 @@ const DEFAULT_SETTINGS: PluginSettings = {
 	logToFile: true,
 	syncthingIgnoreLegacyLogs: true,
 	aggressiveCrossDeviceSync: true,
+	healthHeartbeat: true,
+	healthIntervalMin: 15,
+	couchHealthProbeUrl: '',
 };
 
 const LOG_DIR = LOGGER_LOG_DIR;
+/** Vault-root folder for on-device health heartbeats. NOT in syncIgnoreRegEx, so it syncs home for diagnosis. */
+const HEALTH_DIR = 'sync-health';
+const HEALTH_FILE_MAX_BYTES = 200_000;
+const HEALTH_STARTUP_DELAY_MS = 8000;
 const LOCAL_DEVICE_ID_FILE = '.device-id.local.json';
 const STIGNORE_MARKER_START = '# RCP-E legacy log ignore (Syncthing — auto-managed, prevents sync conflicts)';
 const STIGNORE_MARKER_END = '# END RCP-E legacy log ignore';
@@ -169,6 +185,7 @@ export default class RememberCursorPosition extends Plugin {
 	legacyLogGuardTimer: number | null = null;
 	legacyLogGuardInterval: number | null = null;
 	periodicFlushInterval: number | null = null;
+	healthInterval: number | null = null;
 	ownDeviceStoreCache: DeviceStateStore | null = null;
 	remoteDeviceStoresCache = new Map<string, DeviceStateStore>();
 	/** Last seen storeRevision per remote device — detects LiveSync delivery without vault modify events. */
@@ -376,6 +393,16 @@ export default class RememberCursorPosition extends Plugin {
 				},
 			});
 
+			this.addCommand({
+				id: 'write-health-snapshot',
+				name: 'Write a device health snapshot now',
+				callback: () => {
+					void this.writeHealthSnapshot('manual').then(() => {
+						new Notice(`Health snapshot written to ${HEALTH_DIR}/${this.settings.deviceId}/`);
+					});
+				},
+			});
+
 			this.registerEvent(
 				this.app.workspace.on('file-open', (file) => {
 					if (file) {
@@ -435,6 +462,7 @@ export default class RememberCursorPosition extends Plugin {
 				if (document.visibilityState === 'hidden') {
 					this.logger.info('EVENT', 'App backgrounded — flushing current note');
 					void this.flushCurrentNote(true);
+					void this.writeHealthSnapshot('background');
 				}
 			});
 
@@ -460,6 +488,7 @@ export default class RememberCursorPosition extends Plugin {
 			this.setupDOMEventListeners();
 			void this.seedRemoteStoreRevisionSnapshot();
 			this.applyPeriodicFlush();
+			this.startHealthHeartbeat();
 			void this.restoreCurrentNote();
 
 			this.logger.info('LOAD', 'Plugin onload completed successfully', {
@@ -811,6 +840,7 @@ export default class RememberCursorPosition extends Plugin {
 			this.legacyLogGuardInterval = null;
 		}
 		this.stopPeriodicFlush();
+		this.stopHealthHeartbeat();
 		if (!this.logger) return;
 		this.logger.info('LOAD', 'Plugin onunload started', {
 			lastLoadedFileName: this.lastLoadedFileName,
@@ -1971,6 +2001,136 @@ export default class RememberCursorPosition extends Plugin {
 		}
 	}
 
+	/**
+	 * Health heartbeat: each device records ITS OWN view of sync health on-device, so problems that
+	 * happen while the device is offline / 300 km from the master are still captured and come home later
+	 * (auto via sync, or by a USB/adb pull). The home laptop can't pull from a device it can't reach —
+	 * only the device itself can witness its own disconnection. See scripts/sync-history.ps1 -Analyze.
+	 */
+	startHealthHeartbeat(): void {
+		this.stopHealthHeartbeat();
+		if (!this.settings.healthHeartbeat) return;
+		const minutes = Math.max(1, this.settings.healthIntervalMin || 15);
+		// First snapshot shortly after load (let the app settle), then on a fixed interval.
+		window.setTimeout(() => {
+			void this.writeHealthSnapshot('startup');
+		}, HEALTH_STARTUP_DELAY_MS);
+		this.healthInterval = window.setInterval(() => {
+			void this.writeHealthSnapshot('interval');
+		}, minutes * 60_000);
+	}
+
+	stopHealthHeartbeat(): void {
+		if (this.healthInterval != null) {
+			window.clearInterval(this.healthInterval);
+			this.healthInterval = null;
+		}
+	}
+
+	/** Read the Self-hosted LiveSync trigger flags from its data.json (the recurring "triggers reset to false"
+	 *  failure shows up here — and now we catch it on-device even when the master can't reach this device). */
+	async readLiveSyncHealth(): Promise<Record<string, unknown> | null> {
+		const path = '.obsidian/plugins/obsidian-livesync/data.json';
+		try {
+			if (!(await this.app.vault.adapter.exists(path))) return null;
+			const raw = await this.app.vault.adapter.read(path);
+			const cfg = JSON.parse(raw) as Record<string, unknown>;
+			const keys = [
+				'liveSync', 'syncOnSave', 'syncOnStart', 'periodicReplication',
+				'periodicReplicationInterval', 'syncOnFileOpen', 'isConfigured',
+				'suspendFileWatching', 'doNotSuspendOnFetching', 'encrypt',
+			];
+			const out: Record<string, unknown> = {};
+			for (const k of keys) {
+				if (k in cfg) out[k] = cfg[k];
+			}
+			return out;
+		} catch (e) {
+			return { error: e instanceof Error ? e.message : String(e) };
+		}
+	}
+
+	/** Probe whether this device can reach CouchDB right now. requestUrl bypasses CORS; any HTTP status
+	 *  (even 401 Unauthorized) means the server was reachable. Only runs if a probe URL is configured. */
+	async probeCouch(url: string): Promise<Record<string, unknown>> {
+		const start = Date.now();
+		try {
+			const res = await requestUrl({ url, method: 'GET', throw: false });
+			return { reachable: res.status > 0, status: res.status, ms: Date.now() - start };
+		} catch (e) {
+			return { reachable: false, ms: Date.now() - start, error: e instanceof Error ? e.message : String(e) };
+		}
+	}
+
+	async writeHealthSnapshot(reason: string): Promise<void> {
+		if (!this.settings.healthHeartbeat) return;
+		try {
+			const now = new Date();
+			const deviceId = this.settings.deviceId ?? 'unknown';
+			const livesync = await this.readLiveSyncHealth();
+			let ownStoreRevision = 0;
+			try {
+				ownStoreRevision = (await this.loadOwnDeviceStore()).storeRevision;
+			} catch {
+				// own store may not exist yet
+			}
+			const remoteStoreRevisions: Record<string, number> = {};
+			for (const [id, rev] of this.remoteStoreRevisionSnapshot) {
+				remoteStoreRevisions[id] = rev;
+			}
+			const record: Record<string, unknown> = {
+				ts: now.toISOString(),
+				tsEpoch: now.getTime(),
+				reason,
+				deviceId,
+				deviceName: this.getDeviceLabel(),
+				platform: this.getDevicePlatformLabel(),
+				pluginVersion: this.manifest.version,
+				online: typeof navigator !== 'undefined' ? navigator.onLine : null,
+				appVisible: typeof document !== 'undefined' ? document.visibilityState === 'visible' : null,
+				ownStoreRevision,
+				remoteStoreRevisions,
+				livesync,
+			};
+			const probeUrl = this.settings.couchHealthProbeUrl?.trim();
+			if (probeUrl) {
+				record.couchProbe = await this.probeCouch(probeUrl);
+			}
+			await this.appendHealthLine(deviceId, JSON.stringify(record));
+			this.logger?.debug('SYNC', 'Health snapshot written', { reason, online: record.online });
+		} catch (e) {
+			this.logger?.warn('SYNC', 'Health snapshot failed', {
+				err: e instanceof Error ? e.message : String(e),
+			});
+		}
+	}
+
+	private async appendHealthLine(deviceId: string, line: string): Promise<void> {
+		const deviceDir = `${HEALTH_DIR}/${deviceId}`;
+		if (!(await this.app.vault.adapter.exists(HEALTH_DIR))) {
+			await this.app.vault.adapter.mkdir(HEALTH_DIR);
+		}
+		if (!(await this.app.vault.adapter.exists(deviceDir))) {
+			await this.app.vault.adapter.mkdir(deviceDir);
+		}
+		// Daily-rotated file: each append touches only a small file, so sync churn stays negligible.
+		const day = new Date().toISOString().slice(0, 10);
+		const path = `${deviceDir}/${day}.jsonl`;
+		let existing = '';
+		if (await this.app.vault.adapter.exists(path)) {
+			existing = await this.app.vault.adapter.read(path);
+		}
+		let combined = existing + line + '\n';
+		if (combined.length > HEALTH_FILE_MAX_BYTES) {
+			combined = combined.slice(combined.length - HEALTH_FILE_MAX_BYTES);
+			const firstNewline = combined.indexOf('\n');
+			if (firstNewline >= 0) {
+				combined = combined.slice(firstNewline + 1);
+			}
+		}
+		await this.app.vault.adapter.write(path, combined);
+	}
+
 	async trySyncRetryRestore(notePath: string): Promise<void> {
 		if (this.lastLoadedFileName !== notePath || this.loadingFile) {
 			this.logger.debug('SYNC', 'Delayed re-restore skipped — note no longer active', { notePath });
@@ -2419,6 +2579,15 @@ export default class RememberCursorPosition extends Plugin {
 		if (settings.aggressiveCrossDeviceSync === undefined) {
 			settings.aggressiveCrossDeviceSync = true;
 		}
+		if (settings.healthHeartbeat === undefined) {
+			settings.healthHeartbeat = true;
+		}
+		if (settings.healthIntervalMin == null || settings.healthIntervalMin < 1) {
+			settings.healthIntervalMin = 15;
+		}
+		if (settings.couchHealthProbeUrl === undefined) {
+			settings.couchHealthProbeUrl = '';
+		}
 		const legacyPluginStateDir = this.manifest.dir + '/states';
 		if (!settings.stateDir) {
 			settings.stateDir = RECOMMENDED_STATE_DIR;
@@ -2539,6 +2708,61 @@ class SettingTab extends PluginSettingTab {
 						await this.plugin.saveSettings();
 						this.plugin.applySaveDebounce();
 						this.plugin.applyPeriodicFlush();
+					})
+			);
+
+		containerEl.createEl('h3', { text: 'Device health logging' });
+		containerEl.createEl('p', {
+			text:
+				'Each device records its own sync health (network, LiveSync trigger flags, whether it can reach ' +
+				'the server, sync activity) into sync-health/. This captures problems that happen while a device ' +
+				'is offline or far from home — they come back for diagnosis when sync recovers or you connect the ' +
+				'device. Tiny, daily-rotated files; safe to leave on.',
+			cls: 'setting-item-description',
+		});
+
+		new Setting(containerEl)
+			.setName('Record device health periodically')
+			.setDesc('Write a small health snapshot on an interval and when the app is backgrounded.')
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.healthHeartbeat)
+					.onChange(async (value) => {
+						this.plugin.settings.healthHeartbeat = value;
+						await this.plugin.saveSettings();
+						this.plugin.startHealthHeartbeat();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName('Health snapshot interval (minutes)')
+			.setDesc('How often to record a health snapshot while Obsidian is open.')
+			.addSlider((slider) =>
+				slider
+					.setLimits(5, 60, 5)
+					.setDynamicTooltip()
+					.setValue(this.plugin.settings.healthIntervalMin)
+					.onChange(async (value) => {
+						this.plugin.settings.healthIntervalMin = value;
+						await this.plugin.saveSettings();
+						this.plugin.startHealthHeartbeat();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName('CouchDB reachability probe URL (optional)')
+			.setDesc(
+				'If set, each snapshot records whether this device could reach this URL (e.g. your Tailscale ' +
+				'Serve URL + db: https://host.ts.net/obsidian-vault). Any HTTP response — even 401 — counts as ' +
+				'reachable, so it pinpoints "network was up but the server was unreachable" moments. Leave blank to skip.'
+			)
+			.addText((text) =>
+				text
+					.setPlaceholder('https://host.ts.net/obsidian-vault')
+					.setValue(this.plugin.settings.couchHealthProbeUrl)
+					.onChange(async (value) => {
+						this.plugin.settings.couchHealthProbeUrl = value.trim();
+						await this.plugin.saveSettings();
 					})
 			);
 
