@@ -465,26 +465,45 @@ function Invoke-PullHealth {
     if (-not $adb) { Write-Host "adb not found." -ForegroundColor Red; return }
     $destRoot = Join-Path $VaultDir 'sync-health'
     New-Item -ItemType Directory -Force -Path $destRoot | Out-Null
+    # Best-effort: wake configured wireless devices (USB devices already show in 'adb devices').
+    foreach ($d in $Devices) { & $adb connect "$($d.ip):5555" 2>&1 | Out-Null }
+    # Enumerate EVERY reachable device — USB serials AND wireless. USB works even with Tailscale down.
+    # One device at a time is fine: each run MERGES that device's own logs into the shared master archive,
+    # so connect devices separately, in any order — nothing is overwritten or needs to be simultaneous.
+    $serials = (& $adb devices) | Select-String '\sdevice$' | ForEach-Object { (($_ -split '\s+')[0]).Trim() } | Where-Object { $_ }
+    if (-not $serials) { Write-Host "No adb device reachable. Plug one in via USB (works even when Tailscale is down)." -ForegroundColor Yellow; return }
     $total = 0
-    foreach ($d in $Devices) {
-        $serial = "$($d.ip):5555"
-        if ((& $adb connect $serial 2>&1 | Select-Object -Last 1) -notmatch 'connected') { Write-Host "  $($d.name): not reachable over wireless adb (skip)" -ForegroundColor Yellow; continue }
-        $base = "$($d.vault)/sync-health"
+    foreach ($serial in $serials) {
+        # Discover this device's vault.
+        $vault = $null
+        foreach ($c in @('/storage/emulated/0/ObsidianVault','/storage/emulated/0/Documents/Test','/storage/emulated/0/Documents')) {
+            if ((& $adb -s $serial shell "test -d '$c/sync-health' && echo OK" 2>$null) -match 'OK') { $vault = $c; break }
+        }
+        if (-not $vault) {
+            $found = (& $adb -s $serial shell "ls -d /storage/emulated/0/*/sync-health 2>/dev/null | head -1" 2>$null)
+            if ($found) { $vault = (($found -replace '/sync-health.*$','')).Trim() }
+        }
+        if (-not $vault) { Write-Host "  ${serial}: no sync-health dir found (skip)" -ForegroundColor DarkGray; continue }
+        # Pull ONLY this device's OWN folder (its authoritative self-log) — never its possibly-stale
+        # copies of the other devices' folders, so we don't overwrite fresher data already on the master.
+        $idRaw = (& $adb -s $serial shell "cat '$vault/.obsidian/plugins/remember-cursor-position-enhanced/.device-id.local.json'" 2>$null) -join ''
+        $ownId = ([regex]::Match($idRaw,'"deviceId"\s*:\s*"([^"]+)"')).Groups[1].Value
+        $base = if ($ownId) { "$vault/sync-health/$ownId" } else { "$vault/sync-health" }
         $files = (& $adb -s $serial shell "find '$base' -type f -name '*.jsonl' 2>/dev/null" 2>$null) | ForEach-Object { $_.Trim() } | Where-Object { $_ }
         $n = 0
         foreach ($f in $files) {
-            $rel = $f.Substring($base.Length).TrimStart('/')
+            $rel = $f.Substring("$vault/sync-health".Length).TrimStart('/')
             $dest = Join-Path $destRoot ($rel -replace '/','\')
             New-Item -ItemType Directory -Force -Path (Split-Path $dest -Parent) | Out-Null
             & $adb -s $serial pull "$f" "$dest" 2>$null | Out-Null
             if (Test-Path $dest) { $n++ }
         }
-        Write-Host ("  {0}: pulled {1} health file(s)" -f $d.name, $n) -ForegroundColor Green
+        $idLabel = if ($ownId) { $ownId } else { '?' }
+        Write-Host ("  {0}  vault={1}  ownId={2}: merged {3} file(s)" -f $serial, $vault, $idLabel, $n) -ForegroundColor Green
         $total += $n
     }
-    & $adb disconnect 2>$null | Out-Null
-    Write-Host ("Pulled {0} on-device health file(s) -> {1}" -f $total, $destRoot) -ForegroundColor Green
-    Write-Host "Now run:  pwsh scripts\sync-history.ps1 -Analyze" -ForegroundColor Gray
+    Write-Host ("`nMerged {0} on-device health file(s) -> {1}" -f $total, $destRoot) -ForegroundColor Green
+    Write-Host "Connect another device (USB or wireless) and re-run -PullHealth to add it. Then: -Analyze (no device needed)." -ForegroundColor Gray
 }
 
 # ============================================================ DISPATCH ============================================================
