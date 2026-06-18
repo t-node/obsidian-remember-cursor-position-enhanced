@@ -103,6 +103,16 @@ function Invoke-Snapshot {
             $couch.accepted_nodes = ([regex]::Matches((([regex]::Match($ms,'"accepted_nodes":\[(?<a>[^\]]*)\]')).Groups['a'].Value),'"[^"]+"')).Count
         }
     } catch {}
+    # ANTI-BLOAT GUARD: reclaim disk overhead automatically before it grows
+    if ($couch.reachable -and $couch.file_bytes -and $couch.active_bytes -and -not $couch.compact_running) {
+        $reclaimable = [long]$couch.file_bytes - [long]$couch.active_bytes
+        if ($reclaimable -gt 50MB) {
+            try {
+                curl.exe -s -m 10 -X POST -u $auth "$CouchUrl/$DbName/_compact" -H "Content-Type: application/json" 2>$null | Out-Null
+                $snap.notes += ("auto-compact triggered ({0} MB reclaimable)" -f [math]::Round($reclaimable/1MB))
+            } catch {}
+        }
+    }
     $snap.couch = $couch
 
     # ---- Tailscale (per peer + self) ----
@@ -271,6 +281,7 @@ function Invoke-Analyze {
         W ("   doc_count  {0} -> {1}" -f $dFirst,$dLast)
         W ("   active     {0:n1} MB -> {1:n1} MB   (peak {2:n1} MB)" -f ($aFirst/1MB),($aLast/1MB),($aMax/1MB))
         if ($aFirst -gt 0 -and $aLast -gt $aFirst*1.5) { $verdict += ("CouchDB bloat grew {0:n0}% ({1:n0}->{2:n0} MB) -- consider a rebuild" -f ((($aLast-$aFirst)/$aFirst)*100),($aFirst/1MB),($aLast/1MB)) }
+        if ($aLast -gt 60MB) { $verdict += ("CouchDB active bloat {0:n0} MB (>60MB threshold) -- deep-clean: pwsh scripts\sync-reset.ps1 -Action wipe (then Overwrite remote)" -f ($aLast/1MB)) }
         # longest frozen-seq window while reachable (possible stall)
         $frozen = Get-FrozenSeq $cReach
         if ($frozen.dur -gt 6*3600) { W ("   longest update_seq FROZEN window: {0}  ({1} -> {2})  <- stall if anyone was editing" -f (Dur $frozen.dur),(Fmt $frozen.from),(Fmt $frozen.to)) }
