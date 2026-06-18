@@ -371,7 +371,12 @@ function Invoke-Analyze {
                 for ($i=1; $i -lt $withFlags.Count; $i++) {
                     foreach ($k in $keys) {
                         $ov = $withFlags[$i-1].livesync.$k; $nv = $withFlags[$i].livesync.$k
-                        if ($null -ne $ov -and $null -ne $nv -and [bool]$ov -ne [bool]$nv) { W ("        flag {0}: {1} -> {2}  at {3}" -f $k,$ov,$nv,(Fmt $withFlags[$i].tsUtc)); $verdict += "$($g.Name) LiveSync flag '$k' flipped to $nv (on-device record)" }
+                        if ($null -ne $ov -and $null -ne $nv -and [bool]$ov -ne [bool]$nv) {
+                            $arrow = if ([bool]$nv) { 'ON (fix)' } else { 'OFF' }
+                            W ("        flag {0}: -> {1}  at {2}" -f $k,$arrow,(Fmt $withFlags[$i].tsUtc))
+                            # Only a trigger turning OFF is a problem; turning ON is a fix (don't cry wolf).
+                            if (-not [bool]$nv) { $verdict += "$($g.Name) sync trigger '$k' was turned OFF at $(Fmt $withFlags[$i].tsUtc) (would stop it syncing)" }
+                        }
                     }
                 }
                 if ($withFlags.Count) {
