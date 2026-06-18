@@ -85,12 +85,26 @@ function Pull-DeviceLogs($serial) {
         & $Adb -s $serial pull "$f" "$dest" 2>$null | Out-Null
         if (Test-Path $dest) { $n++ }
     }
-    # Best-effort: RCP-E debug logs (local-only; richer detail when file-logging is enabled).
+    # Best-effort: RCP-E debug logs (local-only; usually off now).
     $rcp = (& $Adb -s $serial shell "ls $vault/rcp-enhanced-logs/*.log 2>/dev/null" 2>$null) | ForEach-Object { $_.Trim() } | Where-Object { $_ }
     $r = 0
     foreach ($lf in $rcp) { $bn = ($lf -split '/')[-1]; & $Adb -s $serial pull "$lf" (Join-Path $RcpDestRoot "$ownId-$bn") 2>$null | Out-Null; if ($?) { $r++ } }
 
-    return [PSCustomObject]@{ serial=$serial; model=$model; ownId=$ownId; healthFiles=$n; rcpLogs=$r }
+    # Logging-health signals: plugin version, heartbeat enabled?, Obsidian running?, freshest log entry.
+    $verRaw = (& $Adb -s $serial shell "grep -m1 version $vault/.obsidian/plugins/remember-cursor-position-enhanced/manifest.json" 2>$null) -join ''
+    $ver = ([regex]::Match($verRaw,'"version"\s*:\s*"([^"]+)"')).Groups[1].Value
+    $rcpRaw = (& $Adb -s $serial shell "cat $vault/.obsidian/plugins/remember-cursor-position-enhanced/data.json" 2>$null) -join ''
+    $hb = ([regex]::Match($rcpRaw,'"healthHeartbeat"\s*:\s*([a-z]+)')).Groups[1].Value
+    if (-not $hb) { $hb = 'true' }   # default-on if the key isn't saved yet
+    $obsRunning = -not [string]::IsNullOrWhiteSpace(((& $Adb -s $serial shell "pidof md.obsidian" 2>$null) -join ''))
+    $lastEpoch = [int64]0
+    if ($ownId -and (Test-Path (Join-Path $DestRoot $ownId))) {
+        Get-ChildItem (Join-Path $DestRoot $ownId) -Filter *.jsonl -EA SilentlyContinue | ForEach-Object {
+            $ln = Get-Content $_.FullName -Tail 1 -EA SilentlyContinue
+            if ($ln) { $m = [regex]::Match($ln,'"tsEpoch":\s*(\d+)'); if ($m.Success -and [int64]$m.Groups[1].Value -gt $lastEpoch) { $lastEpoch = [int64]$m.Groups[1].Value } }
+        }
+    }
+    return [PSCustomObject]@{ serial=$serial; model=$model; ownId=$ownId; healthFiles=$n; rcpLogs=$r; version=$ver; heartbeat=$hb; obsRunning=$obsRunning; lastEpoch=$lastEpoch }
 }
 
 # ---------------------------------------------------------------- banner
@@ -101,20 +115,28 @@ Write-Host "  Connect devices ONE AT A TIME. USB works even with NO network / Ta
 Write-Host "  Each device's full local history merges into the master archive. Order doesn't matter."
 Write-Host ""
 Write-Host "[*] Master laptop logs: already local (vault + 30-min monitor) - included automatically." -ForegroundColor Green
+Write-Host "[*] Capturing a fresh master snapshot of the current state..." -ForegroundColor DarkGray
+& $Pwsh -NoProfile -File (Join-Path $PSScriptRoot 'sync-history.ps1') 2>&1 | Out-Null
 
-$Seen   = @{}
-$Pulled = @()
+$Seen    = @{}
+$SeenIds = @{}
+$Pulled  = @()
 
 function Pull-NewlyConnected {
     foreach ($s in @(Get-ConnectedSerials)) {
         if ($Seen.ContainsKey($s)) { continue }
-        $res = Pull-DeviceLogs $s
         $Seen[$s] = $true
-        if ($res) {
-            Write-Host ("    + pulled {0} (serial {1}, id {2}): {3} history file(s), {4} rcp log(s)" -f `
-                ($res.model ? $res.model : '?'), $res.serial, ($res.ownId ? $res.ownId : '?'), $res.healthFiles, $res.rcpLogs) -ForegroundColor Green
-            $script:Pulled += $res
+        $res = Pull-DeviceLogs $s
+        if (-not $res) { continue }
+        # Same physical device reached via two transports (USB + Wi-Fi) resolves to one ownId — pull once.
+        if ($res.ownId -and $SeenIds.ContainsKey($res.ownId)) {
+            Write-Host ("    (skip {0} - same device as id {1}, already pulled)" -f $res.serial, $res.ownId) -ForegroundColor DarkGray
+            continue
         }
+        if ($res.ownId) { $SeenIds[$res.ownId] = $true }
+        Write-Host ("    + pulled {0} (serial {1}, id {2}): {3} history file(s), {4} rcp log(s)" -f `
+            $(if($res.model){$res.model}else{'?'}), $res.serial, $(if($res.ownId){$res.ownId}else{'?'}), $res.healthFiles, $res.rcpLogs) -ForegroundColor Green
+        $script:Pulled += $res
     }
 }
 
@@ -145,6 +167,36 @@ if ($Auto) {
 
 Write-Host ""
 Write-Host ("Collected logs from {0} device(s) + master." -f $Pulled.Count) -ForegroundColor Green
+
+# ---------------------------------------------------------------- logging health
+Write-Host ""
+Write-Host "=== LOGGING HEALTH — is everything actively capturing right now? ===" -ForegroundColor Cyan
+$task = Get-ScheduledTask -TaskName 'ObsidianSyncHistory' -ErrorAction SilentlyContinue
+if ($task) {
+    $ti = Get-ScheduledTaskInfo -TaskName 'ObsidianSyncHistory' -ErrorAction SilentlyContinue
+    $lr = if ($ti.LastRunTime -and $ti.LastRunTime.Year -gt 2000) { [int]((Get-Date) - $ti.LastRunTime).TotalMinutes } else { -1 }
+    $ok = ($task.State -eq 'Ready' -and $lr -ge 0 -and $lr -le 45)
+    Write-Host ("  master   : {0}  (task {1}, last run {2} min ago, result {3})" -f $(if($ok){'ACTIVE'}else{'CHECK'}), $task.State, $lr, $ti.LastTaskResult) -ForegroundColor $(if($ok){'Green'}else{'Yellow'})
+} else {
+    Write-Host "  master   : ! scheduled task NOT installed -> run  pwsh scripts\sync-history.ps1 -Install" -ForegroundColor Yellow
+}
+foreach ($res in ($Pulled | Where-Object { $_ })) {
+    $name = if ($res.model) { $res.model } else { $res.serial }
+    if ($res.heartbeat -ne 'true') {
+        Write-Host ("  {0,-10}: ! heartbeat DISABLED (RCP-E 'Record device health' is off) -> NOT logging" -f $name) -ForegroundColor Red; continue
+    }
+    if ($res.lastEpoch -le 0) {
+        Write-Host ("  {0,-10}: heartbeat on (v{1}) but no entries yet -> open Obsidian ~15s to seed it" -f $name, $res.version) -ForegroundColor Yellow; continue
+    }
+    $ageMin = [int](((Get-Date).ToUniversalTime() - [DateTimeOffset]::FromUnixTimeMilliseconds($res.lastEpoch).UtcDateTime).TotalMinutes)
+    if ($ageMin -le 20) {
+        Write-Host ("  {0,-10}: ACTIVE  (v{1}, heartbeat on, last entry {2} min ago)" -f $name, $res.version, $ageMin) -ForegroundColor Green
+    } elseif ($res.obsRunning) {
+        Write-Host ("  {0,-10}: CHECK  (Obsidian open but last entry {1} min ago >20 -> heartbeat may be stalled; reopen it)" -f $name, $ageMin) -ForegroundColor Yellow
+    } else {
+        Write-Host ("  {0,-10}: idle  (Obsidian closed; last entry {1} min ago - logging resumes when you open it; normal)" -f $name, $ageMin) -ForegroundColor Gray
+    }
+}
 
 # ---------------------------------------------------------------- analyze
 Write-Host ""
