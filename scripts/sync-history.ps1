@@ -255,7 +255,9 @@ function Invoke-Analyze {
     function Fmt($u){ ([DateTimeOffset]::FromUnixTimeSeconds([int64]$u).ToLocalTime()).ToString('yyyy-MM-dd HH:mm') }
     function Dur($sec){ $t=[TimeSpan]::FromSeconds([math]::Max(0,$sec)); if($t.TotalDays-ge1){'{0:n0}d {1}h'-f[math]::Floor($t.TotalDays),$t.Hours}elseif($t.TotalHours-ge1){'{0}h {1}m'-f[math]::Floor($t.TotalHours),$t.Minutes}else{'{0}m'-f[math]::Floor($t.TotalMinutes)} }
 
-    $verdict = @()
+    $nowIssues  = @()   # broken/unresolved RIGHT NOW -> needs action
+    $pastEvents = @()   # happened during the window but already recovered -> informational only
+    $latest = $rows[-1]
     W ("=" * 78)
     W ("  SYNC HISTORY ANALYSIS   {0} samples   {1}  ->  {2}" -f $rows.Count, (Fmt $rows[0].tsUtc), (Fmt $rows[-1].tsUtc))
     W ("=" * 78)
@@ -277,7 +279,11 @@ function Invoke-Analyze {
     W ""
     W "## COUCHDB"
     $downRuns = Get-FalseRuns $rows { param($r) -not $r.couch.reachable }
-    if ($downRuns.Count) { $verdict += "CouchDB had $($downRuns.Count) unreachable window(s)"; foreach($r in $downRuns){ W ("   UNREACHABLE {0}  ({1} -> {2})" -f (Dur $r.dur),(Fmt $r.from),(Fmt $r.to)) } }
+    if ($downRuns.Count) {
+        foreach($r in $downRuns){ W ("   UNREACHABLE {0}  ({1} -> {2})" -f (Dur $r.dur),(Fmt $r.from),(Fmt $r.to)) }
+        if ([bool]$latest.couch.reachable) { $pastEvents += "CouchDB had $($downRuns.Count) unreachable window(s) — recovered" }
+        else { $nowIssues += "CouchDB is UNREACHABLE right now" }
+    }
     else { W "   reachable in every sample." }
     if ($cReach.Count -ge 2) {
         $seqMin=($cReach.couch.update_seq|Measure-Object -Minimum).Minimum; $seqMax=($cReach.couch.update_seq|Measure-Object -Maximum).Maximum
@@ -286,13 +292,17 @@ function Invoke-Analyze {
         W ("   update_seq {0} -> {1}   (moving = replication happening)" -f $seqMin,$seqMax)
         W ("   doc_count  {0} -> {1}" -f $dFirst,$dLast)
         W ("   active     {0:n1} MB -> {1:n1} MB   (peak {2:n1} MB)" -f ($aFirst/1MB),($aLast/1MB),($aMax/1MB))
-        if ($aFirst -gt 0 -and $aLast -gt $aFirst*1.5) { $verdict += ("CouchDB bloat grew {0:n0}% ({1:n0}->{2:n0} MB) -- consider a rebuild" -f ((($aLast-$aFirst)/$aFirst)*100),($aFirst/1MB),($aLast/1MB)) }
-        if ($aLast -gt 60MB) { $verdict += ("CouchDB active bloat {0:n0} MB (>60MB threshold) -- deep-clean: pwsh scripts\sync-reset.ps1 -Action wipe (then Overwrite remote)" -f ($aLast/1MB)) }
+        if ($aFirst -gt 0 -and $aLast -gt $aFirst*1.5) { W ("   (active grew {0:n0}% across the window)" -f ((($aLast-$aFirst)/$aFirst)*100)) }
+        if ($aLast -gt 60MB) { $nowIssues += ("CouchDB active bloat {0:n0} MB now (>60MB) -- deep-clean: pwsh scripts\sync-reset.ps1 -Action wipe (then Overwrite remote)" -f ($aLast/1MB)) }
         # longest frozen-seq window while reachable (possible stall)
         $frozen = Get-FrozenSeq $cReach
         if ($frozen.dur -gt 6*3600) { W ("   longest update_seq FROZEN window: {0}  ({1} -> {2})  <- stall if anyone was editing" -f (Dur $frozen.dur),(Fmt $frozen.from),(Fmt $frozen.to)) }
         $lockRuns = Get-FalseRuns $cReach { param($r) [bool]$r.couch.locked }
-        foreach ($r in $lockRuns) { W ("   milestone LOCKED {0}  ({1} -> {2})" -f (Dur $r.dur),(Fmt $r.from),(Fmt $r.to)); $verdict += "CouchDB was milestone-LOCKED (blocks all pushes)" }
+        foreach ($r in $lockRuns) { W ("   milestone LOCKED {0}  ({1} -> {2})" -f (Dur $r.dur),(Fmt $r.from),(Fmt $r.to)) }
+        if ($lockRuns.Count) {
+            if ([bool]$latest.couch.locked) { $nowIssues += "CouchDB milestone is LOCKED now (blocks all pushes) -- pwsh scripts\sync-reset.ps1 -Action unlock" }
+            else { $pastEvents += "CouchDB was briefly milestone-locked during the window — recovered (unlocked now)" }
+        }
     }
 
     # ---- per device ----
@@ -306,7 +316,9 @@ function Invoke-Analyze {
             $total = ($offRuns.dur | Measure-Object -Sum).Sum; $longest=($offRuns.dur|Measure-Object -Maximum).Maximum
             W ("   {0,-16} {1} outage(s), total {2}, longest {3}" -f $n,$offRuns.Count,(Dur $total),(Dur $longest))
             foreach ($r in ($offRuns | Select-Object -Last 5)) { W ("        offline {0}  ({1} -> {2})" -f (Dur $r.dur),(Fmt $r.from),(Fmt $r.to)) }
-            $verdict += "$n had $($offRuns.Count) Tailscale outage(s) (longest $(Dur $longest))"
+            $peerNow = $latest.tailscale.$n
+            if ($peerNow -and (-not $peerNow.online)) { $nowIssues += "$n is OFFLINE on Tailscale right now" }
+            else { $pastEvents += "$n had $($offRuns.Count) Tailscale outage(s) (longest $(Dur $longest)) — recovered (watchdog auto-reconnects)" }
         } else { W ("   {0,-16} no outages" -f $n) }
     }
 
@@ -328,7 +340,7 @@ function Invoke-Analyze {
         $allOff = -not ($keys | Where-Object { [bool]$lastFlags.$_ })
         W ("   {0,-10} {1} flag-flip event(s); latest flags: {2}" -f $dn,$flips.Count, (($keys | ForEach-Object { "$_=$([bool]$lastFlags.$_)" }) -join ' '))
         foreach ($f in ($flips | Select-Object -Last 8)) { W ("        $f"); $anyFlip=$true }
-        if ($allOff) { $verdict += "$dn currently has ALL sync triggers OFF (won't replicate on its own -- set a sync-mode preset in the LiveSync UI)" }
+        if ($allOff) { $nowIssues += "$dn currently has ALL sync triggers OFF (won't replicate on its own -- set Sync Mode 'Periodic and on events' in the LiveSync UI)" }
     }
     if (-not $anyFlip) { W "   (no flips captured -- needs >=2 samples with wireless adb reachable to the device)" }
 
@@ -337,7 +349,7 @@ function Invoke-Analyze {
     W "## CLOCK SKEW (device vs laptop, seconds)"
     foreach ($dn in ($devNames | Sort-Object)) {
         $sk = $rows | Where-Object { $null -ne $_.devices.$dn.clockSkewSec } | ForEach-Object { $_.devices.$dn.clockSkewSec }
-        if ($sk.Count) { $mx=($sk|ForEach-Object{[math]::Abs($_)}|Measure-Object -Maximum).Maximum; W ("   {0,-10} max |skew| {1}s over {2} sample(s)" -f $dn,$mx,$sk.Count); if($mx -gt 30){$verdict+="$dn clock skew up to ${mx}s (can make the wrong cursor position win)"} }
+        if ($sk.Count) { $mx=($sk|ForEach-Object{[math]::Abs($_)}|Measure-Object -Maximum).Maximum; W ("   {0,-10} max |skew| {1}s over {2} sample(s)" -f $dn,$mx,$sk.Count); if($mx -gt 30){$nowIssues+="$dn clock skew up to ${mx}s (can make the wrong cursor position win)"} }
     }
 
     # ---- ON-DEVICE HEALTH LOGS (sync-health/, written BY each device — sees what home cannot) ----
@@ -367,10 +379,19 @@ function Invoke-Analyze {
                 W ("   {0}  ({1} samples, {2} -> {3})" -f $g.Name, $rs.Count, (Fmt $rs[0].tsUtc), (Fmt $rs[-1].tsUtc))
                 # offline windows as the DEVICE itself saw them
                 $offRuns = Get-FalseRuns $rs { param($r) $r.online -eq $false }
-                foreach ($r in ($offRuns | Select-Object -Last 6)) { W ("        OFFLINE (self-reported) {0}  ({1} -> {2})" -f (Dur $r.dur),(Fmt $r.from),(Fmt $r.to)); $verdict += "$($g.Name) self-reported offline $(Dur $r.dur) (captured on-device)" }
+                foreach ($r in ($offRuns | Select-Object -Last 6)) { W ("        OFFLINE (self-reported) {0}  ({1} -> {2})" -f (Dur $r.dur),(Fmt $r.from),(Fmt $r.to)) }
+                if ($offRuns.Count) {
+                    if ($rs[-1].online -eq $false) { $nowIssues += "$($g.Name) reports itself OFFLINE right now" }
+                    else { $pastEvents += "$($g.Name) self-reported $($offRuns.Count) offline window(s) — recovered" }
+                }
                 # could-not-reach-CouchDB while having a network (server/Tailscale issue, not the device's wifi)
                 $probeRuns = Get-FalseRuns $rs { param($r) $r.couchProbe -and ($r.couchProbe.reachable -eq $false) -and ($r.online -eq $true) }
-                foreach ($r in ($probeRuns | Select-Object -Last 6)) { W ("        ONLINE but COUCHDB UNREACHABLE {0}  ({1} -> {2})" -f (Dur $r.dur),(Fmt $r.from),(Fmt $r.to)); $verdict += "$($g.Name) had network but could NOT reach CouchDB for $(Dur $r.dur) (server/Tailscale, not device wifi)" }
+                foreach ($r in ($probeRuns | Select-Object -Last 6)) { W ("        ONLINE but COUCHDB UNREACHABLE {0}  ({1} -> {2})" -f (Dur $r.dur),(Fmt $r.from),(Fmt $r.to)) }
+                if ($probeRuns.Count) {
+                    $lastProbe = $rs[-1].couchProbe
+                    if ($lastProbe -and $lastProbe.reachable -eq $false) { $nowIssues += "$($g.Name) has a network but can't reach CouchDB right now (server/Tailscale)" }
+                    else { $pastEvents += "$($g.Name) had $($probeRuns.Count) 'online-but-server-unreachable' window(s) — recovered" }
+                }
                 # LiveSync trigger flag flips, as recorded ON the device (catches the reset even while away)
                 $keys = 'liveSync','syncOnSave','syncOnStart','periodicReplication','syncOnFileOpen'
                 $withFlags = $rs | Where-Object { $_.livesync }
@@ -380,15 +401,17 @@ function Invoke-Analyze {
                         if ($null -ne $ov -and $null -ne $nv -and [bool]$ov -ne [bool]$nv) {
                             $arrow = if ([bool]$nv) { 'ON (fix)' } else { 'OFF' }
                             W ("        flag {0}: -> {1}  at {2}" -f $k,$arrow,(Fmt $withFlags[$i].tsUtc))
-                            # Only a trigger turning OFF is a problem; turning ON is a fix (don't cry wolf).
-                            if (-not [bool]$nv) { $verdict += "$($g.Name) sync trigger '$k' was turned OFF at $(Fmt $withFlags[$i].tsUtc) (would stop it syncing)" }
                         }
                     }
                 }
+                # Issue ONLY if a trigger is STILL off NOW (resolved flips are just history). liveSync OFF is correct.
                 if ($withFlags.Count) {
                     $lf = $withFlags[-1].livesync
-                    $allOff = -not ($keys | Where-Object { [bool]$lf.$_ })
-                    if ($allOff) { W "        latest flags: ALL triggers OFF (won't replicate on its own)" }
+                    $offNow = @($keys | Where-Object { $_ -ne 'liveSync' -and (-not [bool]$lf.$_) })
+                    if ($offNow.Count) {
+                        W ("        latest: triggers OFF now -> {0}" -f ($offNow -join ', '))
+                        $nowIssues += ("$($g.Name) sync trigger(s) OFF now: {0} -- set Sync Mode 'Periodic and on events' in the LiveSync UI" -f ($offNow -join ', '))
+                    }
                 }
             }
         }
@@ -397,8 +420,17 @@ function Invoke-Analyze {
     # ---- verdict ----
     W ""
     W ("=" * 78)
-    if ($verdict.Count -eq 0) { W "  VERDICT: GREEN -- no outages, stalls, lock events, or flag flips in this window." }
-    else { W "  VERDICT: issues found:"; $verdict | Select-Object -Unique | ForEach-Object { W "    - $_" } }
+    if ($nowIssues.Count -eq 0) {
+        W "  STATUS: GREEN -- nothing wrong right now. Everything is healthy and syncing."
+    } else {
+        W "  STATUS: issues needing attention NOW:"
+        $nowIssues | Select-Object -Unique | ForEach-Object { W "    - $_" }
+    }
+    if ($pastEvents.Count) {
+        W ""
+        W "  Recovered / past events (already resolved -- no action needed):"
+        $pastEvents | Select-Object -Unique | ForEach-Object { W "    . $_" }
+    }
     W ("=" * 78)
 
     $rep = Join-Path $HistDir ("ANALYSIS-{0}.txt" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
