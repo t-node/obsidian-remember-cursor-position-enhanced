@@ -132,6 +132,12 @@ function Invoke-Snapshot {
                 }
                 $snap.tailscale[$name] = $e
             }
+            # WATCHDOG: if THIS machine's tailnet connection has dropped (service running but offline),
+            # force a reconnect. This self-heals the kind of overnight outage that froze sync for 7h,
+            # turning a multi-hour outage into at most one snapshot interval -- regardless of the cause.
+            if ($tj.Self -and -not $tj.Self.Online -and $tj.BackendState -ne 'NeedsLogin') {
+                try { tailscale up 2>&1 | Out-Null; $snap.notes += "tailscale watchdog: self was OFFLINE -> ran 'tailscale up' to reconnect" } catch {}
+            }
         }
     } catch { $snap.notes += "tailscale error: $($_.Exception.Message)" }
 
