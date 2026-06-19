@@ -183,6 +183,15 @@ function Patch-LiveSyncJson($json) {
 	$json.periodicReplicationInterval = 10
 	$json.automaticallyDeleteMetadataOfDeletedFiles = 7
 	$json.syncIgnoreRegEx = $GoodSyncIgnoreRegEx
+	# QUIET MODE — no notifications unless something actually breaks (user requirement).
+	$json.useRequestAPI = $true                  # use Obsidian request API (no native fetch) -> kills the CORS warning
+	$json.showStatusOnEditor = $false            # no flashing sync status overlay
+	$json.hideFileWarningNotice = $true          # no "file is not target by local DB" notices
+	$json.lessInformationInLog = $true           # minimal log chatter
+	$json.showMergeDialogOnlyOnActive = $true    # merge prompts only for the file you're editing
+	$json.checkConflictOnlyOnOpen = $true        # background files (cursor-state, logs) never pop a conflict
+	$json.suppressNotifyHiddenFilesChange = $true
+	$json.disableCheckingConfigMismatch = $true  # no config-mismatch nags
 	return $json
 }
 
