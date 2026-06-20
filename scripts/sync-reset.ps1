@@ -189,7 +189,10 @@ function Patch-LiveSyncJson($json) {
 	$json.hideFileWarningNotice = $true          # no "file is not target by local DB" notices
 	$json.lessInformationInLog = $true           # minimal log chatter
 	$json.showMergeDialogOnlyOnActive = $true    # merge prompts only for the file you're editing
-	$json.checkConflictOnlyOnOpen = $true        # background files (cursor-state, logs) never pop a conflict
+	# AUTO-resolve conflicts by newest (ephemeral cursor-state files get stuck conflict branches from
+	# rebuilds; this clears them silently). checkConflictOnlyOnOpen=true POSTPONES + still nags, so OFF.
+	$json.resolveConflictsByNewerFile = $true
+	$json.checkConflictOnlyOnOpen = $false
 	$json.suppressNotifyHiddenFilesChange = $true
 	$json.disableCheckingConfigMismatch = $true  # no config-mismatch nags
 	return $json
