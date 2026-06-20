@@ -60,7 +60,11 @@ $AuthHeader = @{ Authorization = "Basic $([Convert]::ToBase64String([Text.Encodi
 $MilestoneId = '_local%2Fobsydian_livesync_milestone'
 
 # The single source of truth for "calm" config. Keep IN SYNC across all devices.
-$GoodSyncIgnoreRegEx = '^rcp-enhanced-logs/|^cursor-state/\.diag-|^livesync_log'
+# NOTE: cursor-state/ is now FULLY ignored (not just .diag-). The user chose total notification silence
+# over cross-device scroll-position sync: syncing those high-churn files produced endless benign
+# "merged automatically" conflict notices. To RE-ENABLE cross-device cursor sync later, change this back
+# to '^rcp-enhanced-logs/|^cursor-state/\.diag-|^livesync_log'.
+$GoodSyncIgnoreRegEx = '^rcp-enhanced-logs/|^cursor-state/|^livesync_log'
 
 # --- helpers ---------------------------------------------------------------
 function Couch($Method, $Path, $Body) {
