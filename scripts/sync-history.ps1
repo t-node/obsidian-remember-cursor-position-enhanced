@@ -37,6 +37,8 @@ param(
     [switch]$Install,
     [switch]$Uninstall,
     [switch]$PullHealth,
+    [switch]$Conflicts,
+    [switch]$FixConflicts,
     [int]$IntervalMinutes = 30,
     [int]$SinceDays = 0,
     [string]$CouchUrl,[string]$CouchUser,[string]$CouchPass,[string]$DbName,[string]$VaultDir
@@ -549,10 +551,47 @@ function Invoke-PullHealth {
     Write-Host "Connect another device (USB or wireless) and re-run -PullHealth to add it. Then: -Analyze (no device needed)." -ForegroundColor Gray
 }
 
+# ============================================================ CONFLICTS ============================================================
+# Stuck LiveSync conflict branches (the "files are conflicted" nag) can't be fixed by any setting — LiveSync's
+# auto-resolver SKIPS already-conflicted files. The only fix is deleting the loser branches in CouchDB.
+# Works despite E2EE/path-obfuscation (no decryption needed).
+function Get-LiveConflicts {
+    $auth = "${CouchUser}:${CouchPass}"
+    try { $ch = curl.exe -s -m 40 -u $auth "$CouchUrl/$DbName/_changes?style=all_docs" | ConvertFrom-Json } catch { return @() }
+    $out = @()
+    foreach ($r in ($ch.results | Where-Object { $_.changes.Count -gt 1 -and -not $_.deleted })) {
+        try { $d = curl.exe -s -m 15 -u $auth "$CouchUrl/$DbName/$([uri]::EscapeDataString($r.id))?conflicts=true" | ConvertFrom-Json } catch { continue }
+        if ($d._conflicts) { $out += [PSCustomObject]@{ id=$r.id; winner=$d._rev; losers=@($d._conflicts) } }
+    }
+    return $out
+}
+function Invoke-Conflicts {
+    Write-Host "Scanning CouchDB for stuck conflict branches..." -ForegroundColor Cyan
+    $c = @(Get-LiveConflicts)
+    if (-not $c.Count) { Write-Host "  CLEAN — 0 live conflicts." -ForegroundColor Green; return }
+    Write-Host ("  {0} doc(s) with live conflicts:" -f $c.Count) -ForegroundColor Yellow
+    $c | ForEach-Object { Write-Host ("    {0}  winner={1}  stale-branches={2}" -f $_.id, $_.winner, ($_.losers -join ',')) }
+    Write-Host "  Clear them with:  pwsh scripts\sync-history.ps1 -FixConflicts" -ForegroundColor Gray
+}
+function Invoke-FixConflicts {
+    $c = @(Get-LiveConflicts)
+    if (-not $c.Count) { Write-Host "No live conflicts. Nothing to fix." -ForegroundColor Green; return }
+    Write-Host ("Resolving {0} conflicted doc(s) by KEEPING the newest revision (deleting stale branches)..." -f $c.Count) -ForegroundColor Cyan
+    $auth = "${CouchUser}:${CouchPass}"; $n=0
+    foreach ($x in $c) {
+        foreach ($rev in $x.losers) { curl.exe -s -X DELETE -u $auth "$CouchUrl/$DbName/$([uri]::EscapeDataString($x.id))?rev=$rev" | Out-Null; $n++ }
+        Write-Host ("  resolved {0} (dropped {1} stale branch(es))" -f $x.id, $x.losers.Count) -ForegroundColor Green
+    }
+    Write-Host ("Done — deleted {0} stale conflict branch(es). Reopen Obsidian on each device to pull the resolution." -f $n) -ForegroundColor Green
+    Write-Host "NOTE: keeps the newest version of each file. For ephemeral cursor-state this is always correct." -ForegroundColor Gray
+}
+
 # ============================================================ DISPATCH ============================================================
-if ($Install)    { Invoke-Install; return }
-if ($Uninstall)  { Invoke-Uninstall; return }
-if ($PullHealth) { Invoke-PullHealth; return }
-if ($Analyze)    { Invoke-Analyze; return }
+if ($Install)      { Invoke-Install; return }
+if ($Uninstall)    { Invoke-Uninstall; return }
+if ($PullHealth)   { Invoke-PullHealth; return }
+if ($Conflicts)    { Invoke-Conflicts; return }
+if ($FixConflicts) { Invoke-FixConflicts; return }
+if ($Analyze)      { Invoke-Analyze; return }
 $script:PrevSnap = Read-LastSnapshot   # capture BEFORE writing the new line, for transition diff
 Invoke-Snapshot | Out-Null

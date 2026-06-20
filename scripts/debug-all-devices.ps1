@@ -226,6 +226,8 @@ try {
         }
     }
 } catch { Write-Host "  CouchDB check skipped ($($_.Exception.Message))" -ForegroundColor DarkGray }
+# Stuck conflict branches (the "files are conflicted" nag). Detect; offer the one-command fix.
+& $Pwsh -NoProfile -File $hist -Conflicts
 Write-Host "  Issues that need a device-side action (re-enable sync triggers, reconnect Wi-Fi/Tailscale)" -ForegroundColor Gray
 Write-Host "  are listed in the VERDICT above with exact steps - they can't be auto-applied remotely." -ForegroundColor Gray
 
