@@ -186,6 +186,10 @@ export default class RememberCursorPosition extends Plugin {
 	legacyLogGuardInterval: number | null = null;
 	periodicFlushInterval: number | null = null;
 	healthInterval: number | null = null;
+	/** Errors captured since the last health snapshot — folded into the durable log so none are missed. */
+	recentErrors: Array<{ ts: string; category: string; message: string }> = [];
+	errorCountTotal = 0;
+	errorSnapshotTimer: number | null = null;
 	ownDeviceStoreCache: DeviceStateStore | null = null;
 	remoteDeviceStoresCache = new Map<string, DeviceStateStore>();
 	/** Last seen storeRevision per remote device — detects LiveSync delivery without vault modify events. */
@@ -273,7 +277,22 @@ export default class RememberCursorPosition extends Plugin {
 			writeFile: (path, content) => this.createSafeLogWriter()(path, content),
 			readFile: (path) => this.app.vault.adapter.read(path),
 			exists: (path) => this.app.vault.adapter.exists(path),
+			onError: (category, message) => this.captureError(category, message),
 		}));
+	}
+
+	/** Record an error into the durable health log (silently — no notifications) and snapshot it
+	 *  promptly so it survives even if the app is closed before the next periodic heartbeat. */
+	captureError(category: string, message: string): void {
+		this.errorCountTotal++;
+		this.recentErrors.push({ ts: new Date().toISOString(), category, message });
+		if (this.recentErrors.length > 50) this.recentErrors.shift();
+		if (this.errorSnapshotTimer == null) {
+			this.errorSnapshotTimer = window.setTimeout(() => {
+				this.errorSnapshotTimer = null;
+				void this.writeHealthSnapshot('error');
+			}, 5000);   // debounce: at most one error-triggered snapshot per 5s
+		}
 	}
 
 	async onload() {
@@ -2026,6 +2045,10 @@ export default class RememberCursorPosition extends Plugin {
 			window.clearInterval(this.healthInterval);
 			this.healthInterval = null;
 		}
+		if (this.errorSnapshotTimer != null) {
+			window.clearTimeout(this.errorSnapshotTimer);
+			this.errorSnapshotTimer = null;
+		}
 	}
 
 	/** Read the Self-hosted LiveSync trigger flags from its data.json (the recurring "triggers reset to false"
@@ -2092,7 +2115,10 @@ export default class RememberCursorPosition extends Plugin {
 				ownStoreRevision,
 				remoteStoreRevisions,
 				livesync,
+				errorCountTotal: this.errorCountTotal,
+				errors: this.recentErrors.slice(),   // errors since the last snapshot (then cleared)
 			};
+			this.recentErrors = [];
 			const probeUrl = this.settings.couchHealthProbeUrl?.trim();
 			if (probeUrl) {
 				record.couchProbe = await this.probeCouch(probeUrl);

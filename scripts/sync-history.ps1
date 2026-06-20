@@ -424,6 +424,17 @@ function Invoke-Analyze {
                         $nowIssues += ("$($g.Name) sync trigger(s) OFF now: {0} -- set Sync Mode 'Periodic and on events' in the LiveSync UI" -f ($offNow -join ', '))
                     }
                 }
+                # PLUGIN ERRORS captured silently into the heartbeat (no error missed; no popups)
+                $errs = @()
+                foreach ($rr in $rs) { if ($rr.errors) { foreach ($e in @($rr.errors)) { $errs += [PSCustomObject]@{ tsUtc=$rr.tsUtc; line="$($e.ts) [$($e.category)] $($e.message)" } } } }
+                if ($errs.Count) {
+                    W ("        PLUGIN ERRORS logged: {0}" -f $errs.Count)
+                    foreach ($e in ($errs | Select-Object -Last 6)) { W ("          $($e.line)") }
+                    $lastErr = ($errs | Sort-Object tsUtc | Select-Object -Last 1).tsUtc
+                    $ageH = if ($lastErr) { ((Get-Date).ToUniversalTime() - [DateTimeOffset]::FromUnixTimeSeconds([int64]$lastErr).UtcDateTime).TotalHours } else { 999 }
+                    if ($ageH -le 6) { $nowIssues += "$($g.Name) logged $($errs.Count) plugin error(s) (most recent <6h ago) -- see ON-DEVICE section" }
+                    else { $pastEvents += "$($g.Name) logged $($errs.Count) plugin error(s) (last >6h ago)" }
+                }
             }
         }
 

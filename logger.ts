@@ -20,6 +20,9 @@ export interface LoggerOptions {
 	writeFile: (path: string, content: string) => Promise<void>;
 	readFile: (path: string) => Promise<string>;
 	exists: (path: string) => Promise<boolean>;
+	/** Called for every ERROR — lets the plugin capture errors into the durable health log
+	 *  even when file logging is off, so NO error is ever missed. Silent (no notifications). */
+	onError?: (category: LogCategory, message: string, data?: Record<string, unknown>) => void;
 }
 
 const LOG_PREFIX = 'RCP-E';
@@ -109,6 +112,12 @@ export class PluginLogger {
 		if (level === 'ERROR') console.error(line);
 		else if (level === 'WARN') console.warn(line);
 		else console.log(line);
+
+		// Surface every ERROR to the plugin so it lands in the durable health log (no error missed),
+		// regardless of file logging. Never throws into the caller.
+		if (level === 'ERROR' && opts.onError) {
+			try { opts.onError(category, message, data); } catch { /* ignore */ }
+		}
 
 		if (opts.logToFile && (opts.enabled || level === 'ERROR')) {
 			this.buffer.push(line);
