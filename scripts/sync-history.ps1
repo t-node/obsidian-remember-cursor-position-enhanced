@@ -295,7 +295,10 @@ function Invoke-Analyze {
         W ("   doc_count  {0} -> {1}" -f $dFirst,$dLast)
         W ("   active     {0:n1} MB -> {1:n1} MB   (peak {2:n1} MB)" -f ($aFirst/1MB),($aLast/1MB),($aMax/1MB))
         if ($aFirst -gt 0 -and $aLast -gt $aFirst*1.5) { W ("   (active grew {0:n0}% across the window)" -f ((($aLast-$aFirst)/$aFirst)*100)) }
-        if ($aLast -gt 60MB) { $nowIssues += ("CouchDB active bloat {0:n0} MB now (>60MB) -- deep-clean: pwsh scripts\sync-reset.ps1 -Action wipe (then Overwrite remote)" -f ($aLast/1MB)) }
+        # Threshold raised to 120MB: post-Fetch baseline is ~62MB (re-downloading the DB to each device
+        # leaves chunks only a rebuild reclaims, and a rebuild re-creates conflict tangles -- not worth it).
+        # Genuine bloat (the old 271MB kind) still trips this; the ~62MB baseline no longer false-flags.
+        if ($aLast -gt 120MB) { $nowIssues += ("CouchDB active bloat {0:n0} MB now (>120MB) -- deep-clean: pwsh scripts\sync-reset.ps1 -Action wipe (then Overwrite remote + re-Fetch all devices)" -f ($aLast/1MB)) }
         # longest frozen-seq window while reachable (possible stall)
         $frozen = Get-FrozenSeq $cReach
         if ($frozen.dur -gt 6*3600) { W ("   longest update_seq FROZEN window: {0}  ({1} -> {2})  <- stall if anyone was editing" -f (Dur $frozen.dur),(Fmt $frozen.from),(Fmt $frozen.to)) }
