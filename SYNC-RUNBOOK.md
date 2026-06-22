@@ -12,6 +12,8 @@ forever, across any number of devices. Everything here is driven by **one script
   Each device writes **only its own** file. On note-open it merges all device files and restores
   the newest position. Single-writer files = **structurally impossible to conflict**.
 - **LiveSync → CouchDB** (on the laptop) is just the _pipe_ that copies those files between devices.
+  CouchDB itself runs as a **Docker container inside WSL Ubuntu** (`obsidian-livesync-couchdb`,
+  `restart: unless-stopped`). Windows reaches it through a **stable bridge** — see §1c.
 - **The laptop (`C:\notes1`) is always the source of truth.** Every reset re-uploads the laptop
   and every other device fetches it. Never the other way around.
 
@@ -56,6 +58,71 @@ on each phone/tablet for a few seconds** (mobile only syncs in the foreground). 
 
 After a phone/tablet **reboot**, wireless adb resets — plug it into USB once and run
 `pwsh scripts/adb-net.ps1 -Enable`, then unplug. Cable-free again.
+
+## 1c. CouchDB unreachable / phone+tablet get 502 — the WSL bridge
+
+CouchDB lives in **WSL Docker**, so two things can take the whole pipe down:
+
+1. **WSL isn't running** (after a reboot — WSL doesn't auto-start). Symptom: `127.0.0.1:5984`
+   refused everywhere; analyzer says `CouchDB UNREACHABLE`.
+2. **The WSL2 localhost relay wedges** (Win10). Symptom: CouchDB is healthy *inside* WSL but
+   Windows gets connection-refused on `127.0.0.1:5984`, and the phone/tablet get **502** over
+   Tailscale. The relay binds the port but stops forwarding.
+
+Both are now handled automatically. A scheduled task **`ObsidianCouchBridge`** runs
+`scripts/sync-couch-bridge.ps1` **at logon and every 30 min** (elevated). Each run:
+
+- starts WSL + waits for CouchDB to be healthy,
+- reads the current WSL VM IP (it changes every boot), and
+- (re)points a stable loopback bridge **`127.0.0.1:5994` → `<WSL-IP>:5984`** that never uses
+  the flaky relay. Tailscale Serve proxies `https://<host>.ts.net/` → `127.0.0.1:5994`.
+
+**Manual recovery (rarely needed):**
+
+```powershell
+# Re-assert the bridge right now (UAC prompt — needs admin for netsh portproxy)
+Start-Process pwsh -Verb RunAs -ArgumentList '-File C:\obsidian-remember-cursor-position\scripts\sync-couch-bridge.ps1'
+# Watch it: debug-reports\bridge.log  (look for "=== bridge OK ===")
+```
+
+**One-time hardening (recommended):** point the **laptop's** Obsidian LiveSync at the bridge so
+it's immune to the relay too — Settings → Self-hosted LiveSync → Remote → set URI to
+`http://127.0.0.1:5994/`, Test, Apply. (Phone/tablet already use the bridge via Tailscale.)
+
+### Why it now survives a reboot (the 2026-06-21 outage cause)
+
+A Windows restart left WSL stopped and nobody restarted it → CouchDB was down 27h. The full
+auto-start chain is now:
+
+```
+power on  →  Windows auto-login (AutoAdminLogon, no-password Admin acct)
+          →  ObsidianCouchBridge logon task runs sync-couch-bridge.ps1
+          →  `wsl` cold-starts Ubuntu  →  systemd (wsl.conf [boot] systemd=true)
+          →  docker.service (enabled)  →  CouchDB container (restart: unless-stopped)
+          →  portproxy 127.0.0.1:5994 → <WSL-IP>:5984 set + verified
+```
+
+Every link is automatic and was tested from a fully-stopped WSL (recovers in ~10s). The task
+also re-runs every 30 min, so a mid-session WSL restart or relay wedge self-heals too.
+
+To undo auto-login later: set `AutoAdminLogon=0` under
+`HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon`.
+
+### Backups
+
+`scripts/sync-couch-backup.ps1` tars the CouchDB volume (`livesync_couchdb-data`) to
+`C:\notes1-couchdb-backups\couchdb-<timestamp>.tgz`. The **ObsidianCouchBackup** task runs it
+**daily 02:00 + at every logon**, keeping the newest 14. Restore: stop the container, wipe the
+volume, untar a snapshot back into it.
+
+### Re-install the tasks (if ever deleted)
+
+```powershell
+Start-Process pwsh -Verb RunAs -ArgumentList '-File C:\obsidian-remember-cursor-position\scripts\_install_bridge_task.ps1'
+Start-Process pwsh -Verb RunAs -ArgumentList '-File C:\obsidian-remember-cursor-position\scripts\_install_backup_task.ps1'
+```
+
+---
 
 ## 2. The deep reset (RARE — only for chunk errors / bloat, not normal stalls)
 
