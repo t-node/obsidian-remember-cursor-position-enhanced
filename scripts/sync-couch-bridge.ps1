@@ -47,11 +47,24 @@ $wslip = (wsl -d $Distro -- bash -lc "hostname -I" 2>$null).Trim().Split(" ")[0]
 if (-not $wslip) { Note "ERROR: could not read WSL IP. Aborting."; exit 1 }
 Note "WSL IP = $wslip"
 
-# 3. Reset the loopback portproxy to the current WSL IP.
-netsh interface portproxy delete v4tov4 listenport=$Port listenaddress=127.0.0.1 2>&1 | Out-Null
-$add = netsh interface portproxy add v4tov4 listenport=$Port listenaddress=127.0.0.1 connectport=5984 connectaddress=$wslip 2>&1
-if ($LASTEXITCODE -ne 0) { Note "ERROR: netsh portproxy add failed (need admin?): $add"; exit 1 }
-Note "portproxy 127.0.0.1:$Port -> ${wslip}:5984 set"
+# 3. Set the loopback portproxy ONLY if it's missing or stale. Re-adding it when nothing
+#    changed needlessly tears down the listener and disrupts Tailscale Serve's upstream
+#    (causes 502 popups on phone/tablet every run). So we make this a no-op in steady state.
+$show = netsh interface portproxy show v4tov4 2>$null
+$current = $null
+foreach ($line in ($show -split "`r?`n")) {
+  if ($line -match "^\s*127\.0\.0\.1\s+$Port\s+(\d+\.\d+\.\d+\.\d+)\s+5984\s*$") { $current = $matches[1] }
+}
+$changed = $false
+if ($current -ne $wslip) {
+  netsh interface portproxy delete v4tov4 listenport=$Port listenaddress=127.0.0.1 2>&1 | Out-Null
+  $add = netsh interface portproxy add v4tov4 listenport=$Port listenaddress=127.0.0.1 connectport=5984 connectaddress=$wslip 2>&1
+  if ($LASTEXITCODE -ne 0) { Note "ERROR: netsh portproxy add failed (need admin?): $add"; exit 1 }
+  $changed = $true
+  Note "portproxy 127.0.0.1:$Port -> ${wslip}:5984 set (was: $($current ?? 'none'))"
+} else {
+  Note "portproxy already correct (127.0.0.1:$Port -> ${wslip}:5984); left untouched"
+}
 
 # 4. Verify with an AUTHENTICATED read (the only correct health check; unauth GET / is 401 by design).
 $h = @{ Authorization = ("Basic " + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($cred))) }
@@ -64,5 +77,23 @@ for ($i = 1; $i -le 8; $i++) {
   } catch { Start-Sleep -Milliseconds 800 }
 }
 if (-not $ok) { Note "ERROR: bridge not serving after portproxy set. Aborting."; exit 1 }
+
+# 5. Tailscale Serve (phone/tablet path) must proxy https://<host>.ts.net/ -> 127.0.0.1:$Port.
+#    Re-assert ONLY if it drifted or we just changed the portproxy (avoid churn = avoid 502s).
+$ts = "C:\Program Files\Tailscale\tailscale.exe"
+if (Test-Path $ts) {
+  $serveStatus = & $ts serve status 2>&1 | Out-String
+  $serveOk = $serveStatus -match [regex]::Escape("127.0.0.1:$Port")
+  if ($changed -or -not $serveOk) {
+    & $ts serve reset 2>&1 | Out-Null
+    Start-Sleep -Seconds 2
+    & $ts serve --bg "http://127.0.0.1:$Port" 2>&1 | Out-Null
+    Note "Tailscale Serve (re)asserted -> 127.0.0.1:$Port (changed=$changed serveWasOk=$serveOk)"
+  } else {
+    Note "Tailscale Serve already -> 127.0.0.1:$Port; left untouched"
+  }
+} else {
+  Note "WARN: tailscale.exe not found; skipped Serve check (phone/tablet path unmanaged)"
+}
 Note "=== bridge OK ==="
 exit 0
