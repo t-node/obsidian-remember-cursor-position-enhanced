@@ -35,7 +35,7 @@ $IGNORES = @(
   '/.obsidian/workspace.json'
   '/.obsidian/workspace-mobile.json'
   '/.obsidian/workspace.json.bak'
-  '/.obsidian/plugins/obsidian-livesync/data.json'
+  '(?d)/.obsidian/plugins/obsidian-livesync/data.json'
   '/.obsidian/plugins/remember-cursor-position-enhanced/.device-id.local.json'
   '(?d)/.obsidian/**/*.log'
   '/rcp-enhanced-logs'
