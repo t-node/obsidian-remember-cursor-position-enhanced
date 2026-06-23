@@ -332,22 +332,16 @@ export function shouldApplyMergedState(
 		return true;
 	}
 
-	if ((applied.revision ?? 0) > (disk.revision ?? 0)) {
-		return false;
-	}
-
-	if ((applied.lastModified ?? 0) > (disk.lastModified ?? 0)) {
-		return false;
-	}
-
-	if ((disk.revision ?? 0) > (applied.revision ?? 0)) {
-		return true;
-	}
-
-	if ((disk.lastModified ?? 0) > (applied.lastModified ?? 0)) {
-		return true;
-	}
-
+	// Recency is decided by wall-clock (lastModified) only, matching the cross-device merge
+	// comparator (compareAcrossDevices). `revision` is a PER-DEVICE counter and must NOT gate
+	// applies: comparing it across devices let whichever device had the higher counter win
+	// forever and reject every other device's genuinely newer position (the "my scroll position
+	// never syncs to other devices" bug). Same-device revision ordering is already resolved by
+	// the merge (compareSameDeviceRevision) before this function is reached.
+	const diskTime = disk.lastModified ?? 0;
+	const appliedTime = applied.lastModified ?? 0;
+	if (appliedTime > diskTime) return false;
+	if (diskTime > appliedTime) return true;
 	return false;
 }
 
@@ -439,19 +433,15 @@ export function explainApplyRejection(
 		return 'would apply (weak local top-of-note vs remote scroll)';
 	}
 
-	if ((applied.revision ?? 0) > (disk.revision ?? 0)) {
-		return `local revision newer (${applied.revision} > ${disk.revision ?? 0})`;
+	const diskTime = disk.lastModified ?? 0;
+	const appliedTime = applied.lastModified ?? 0;
+	if (appliedTime > diskTime) {
+		return `local timestamp newer (${appliedTime} > ${diskTime})`;
 	}
-	if ((applied.lastModified ?? 0) > (disk.lastModified ?? 0)) {
-		return `local timestamp newer (${applied.lastModified} > ${disk.lastModified ?? 0})`;
+	if (diskTime > appliedTime) {
+		return `would apply (merged timestamp newer: ${diskTime} > ${appliedTime})`;
 	}
-	if ((disk.revision ?? 0) > (applied.revision ?? 0)) {
-		return 'would apply (merged revision newer)';
-	}
-	if ((disk.lastModified ?? 0) > (applied.lastModified ?? 0)) {
-		return 'would apply (merged timestamp newer)';
-	}
-	return 'states differ but timestamps/revisions tied';
+	return 'states differ but timestamps tied';
 }
 
 /** Find the nearest markdown heading line at or above `line` (for cross-device anchor). */

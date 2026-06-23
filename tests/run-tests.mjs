@@ -465,6 +465,19 @@ test('shouldApplyMergedState still applies a real remote position over weak loca
 	);
 });
 
+test('shouldApplyMergedState applies newer-by-time remote even when local revision counter is higher (cross-device fix)', () => {
+	// Per-device `revision` counters are NOT comparable across devices. A remote position that is
+	// newer by wall-clock must win even when this device's revision counter is far higher — else
+	// the most-used device wins forever and other devices' scroll positions never sync.
+	assert.equal(
+		shouldApplyMergedState(
+			{ scroll: 111.98, lastModified: 1782241276835, revision: 6633, cursor: { from: { line: 5, ch: 0 }, to: { line: 5, ch: 0 } } },
+			{ scroll: 88.93, lastModified: 1782233824381, revision: 11381, cursor: { from: { line: 3, ch: 0 }, to: { line: 3, ch: 0 } } }
+		),
+		true
+	);
+});
+
 test('explainApplyRejection describes local timestamp win', () => {
 	const reason = explainApplyRejection(
 		{ scroll: 500, lastModified: 1000 },
