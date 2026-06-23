@@ -1,54 +1,54 @@
 <#
-  sync-now.ps1 — FORCE an immediate Syncthing sync across everything reachable.
+  sync-now.ps1 — FORCE an immediate Syncthing sync across everything reachable, via clean REST
+  rescans (no fragile screen-taps).
 
-  Syncthing already auto-syncs within ~1-2s on the LAN (fsWatcher). This button is for when you
-  want to force it RIGHT NOW: it rescans the hub's folder (pushes the laptop's latest immediately)
-  and taps "RESCAN ALL" on every ADB-reachable Android device (pushes theirs immediately). Any
-  connected peer then converges within a couple of seconds.
+  - Hub (laptop): rescan via its local REST API.
+  - Each ADB-reachable Android device: adb-forward its Syncthing GUI port and rescan via REST
+    (falls back to tapping "RESCAN ALL" in the app if REST isn't reachable).
 
-  Note: a device that's away / not on ADB just syncs on its own fsWatcher — or tap RESCAN ALL in
-  its own Syncthing app. There is no truly "synchronous everywhere" in Syncthing (it's
-  device-by-device, eventually-consistent) — this makes it as close to instant as possible.
-
-  No elevation needed.
+  Keys/serials come from scripts/sync.config.ps1 (gitignored). With fsWatcherDelayS=1s on every
+  device, normal changes already propagate in ~1-2s on their own — this button just forces it now.
 #>
-$key = "DGutrUqQGvPgZPxdxaR9YY9UwNpd7d4r"
-$folder = "515yk-rnqru"
-$base = "http://127.0.0.1:8384/rest"
-$h = @{ 'X-API-Key' = $key }
+$cfgPath = Join-Path $PSScriptRoot 'sync.config.ps1'
+if (-not (Test-Path $cfgPath)) { Write-Host "Missing scripts\sync.config.ps1 (Syncthing keys)." -ForegroundColor Red; exit 1 }
+. $cfgPath
+$hubKey = $SyncConfig.SyncthingHubApiKey
+$folder = $SyncConfig.SyncthingFolderId
+$hubBase = "http://127.0.0.1:8384/rest"
+$adb = (Get-Command adb -ErrorAction SilentlyContinue).Source
+if (-not $adb) { $adb = "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" }
 
 Write-Host "=== SYNC NOW ===" -ForegroundColor Cyan
 
-# 1. Hub: rescan now (pushes the laptop's latest to all connected peers)
+# 1. Hub: rescan via REST
 try {
-  Invoke-RestMethod "$base/db/scan?folder=$folder" -Method Post -Headers $h -TimeoutSec 20 | Out-Null
-  Write-Host "  hub (laptop): rescan triggered" -ForegroundColor Green
-} catch {
-  Write-Host "  hub rescan FAILED — is Syncthing running? ($($_.Exception.Message))" -ForegroundColor Red
-}
+  Invoke-RestMethod "$hubBase/db/scan?folder=$folder" -Method Post -Headers @{ 'X-API-Key' = $hubKey } -TimeoutSec 20 | Out-Null
+  Write-Host "  hub (laptop): rescan OK" -ForegroundColor Green
+} catch { Write-Host "  hub rescan FAILED: $($_.Exception.Message)" -ForegroundColor Red }
 
-# 2. Android devices on ADB: force RESCAN ALL so they push their changes immediately
-$adb = (Get-Command adb -ErrorAction SilentlyContinue).Source
-if (-not $adb) { $adb = "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" }
-$pkg = "com.github.catfriend1.syncthingandroid"
+# 2. Android devices: clean REST rescan over an adb-forwarded GUI port
 if (Test-Path $adb) {
-  $devs = & $adb devices | Select-String "device$" | ForEach-Object { ($_ -split "\s+")[0] } | Where-Object { $_ -and $_ -ne 'List' }
-  if ($devs) {
-    foreach ($d in $devs) {
-      & $adb -s $d shell "monkey -p $pkg -c android.intent.category.LAUNCHER 1" *> $null
-      Start-Sleep -Milliseconds 1500
-      & $adb -s $d shell input tap 1069 82 *> $null   # 'RESCAN ALL' (Syncthing-Fork top bar, landscape)
-      Write-Host "  android $($d): RESCAN ALL tapped" -ForegroundColor Green
+  $online = & $adb devices | Select-String "device$" | ForEach-Object { ($_ -split "\s+")[0] } | Where-Object { $_ -and $_ -ne 'List' }
+  foreach ($d in $SyncConfig.SyncthingAndroid) {
+    $serial = $online | Where-Object { $_ -eq $d.serial -or $_ -like "*$($d.ip)*" } | Select-Object -First 1
+    if (-not $serial) {
+      Write-Host "  $($d.name): not on ADB — it auto-syncs on its own (1s watcher), or tap RESCAN ALL in-app" -ForegroundColor DarkGray
+      continue
     }
-  } else { Write-Host "  no Android devices on ADB (they'll sync on their own / tap RESCAN ALL in-app)" -ForegroundColor DarkGray }
-} else {
-  Write-Host "  adb not found; skipped Android devices" -ForegroundColor DarkGray
-}
+    $lp = $d.localPort
+    & $adb -s $serial forward "tcp:$lp" tcp:8384 *> $null
+    try {
+      Invoke-RestMethod "https://127.0.0.1:$lp/rest/db/scan?folder=$folder" -Method Post -Headers @{ 'X-API-Key' = $d.apikey } -SkipCertificateCheck -TimeoutSec 15 | Out-Null
+      Write-Host "  $($d.name): clean REST rescan OK" -ForegroundColor Green
+    } catch {
+      & $adb -s $serial shell "monkey -p com.github.catfriend1.syncthingandroid -c android.intent.category.LAUNCHER 1" *> $null
+      Start-Sleep -Milliseconds 1500
+      & $adb -s $serial shell input tap 1069 82 *> $null   # 'RESCAN ALL' fallback
+      Write-Host "  $($d.name): REST unavailable, used RESCAN ALL tap" -ForegroundColor Yellow
+    } finally {
+      & $adb -s $serial forward --remove "tcp:$lp" *> $null
+    }
+  }
+} else { Write-Host "  adb not found; skipped Android devices" -ForegroundColor DarkGray }
 
-# 3. Show connected peers
-Start-Sleep -Seconds 2
-try {
-  $c = Invoke-RestMethod "$base/system/connections" -Headers $h -TimeoutSec 8
-  $n = @($c.connections.PSObject.Properties | Where-Object { $_.Value.connected }).Count
-  Write-Host "`n  connected peers: $n — converging now (a few seconds)." -ForegroundColor Cyan
-} catch {}
+Write-Host "`n  Done — connected peers converge within ~1-2s." -ForegroundColor Cyan
