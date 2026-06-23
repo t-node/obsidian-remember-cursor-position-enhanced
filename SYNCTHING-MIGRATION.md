@@ -26,12 +26,21 @@ chunk bloat). Syncthing does direct file transfer — faster for bulk, no databa
   one cursor file and cursor-position sync broke. **Fix: that file MUST be in the ignore list**
   (it now is), and each device needs its own ID (tablet restored to `bri9e1q4`). The plugin even
   defines `STIGNORE_LOCAL_RULES` for exactly this. Don't forget it when adding the phone / 2nd laptop.
-- **`.stignore` (set on every device):** `*.sync-conflict-*`, `.obsidian/workspace*`,
-  `.obsidian/**/*.log`, **`.obsidian/plugins/remember-cursor-position-enhanced/.device-id.local.json`**,
+- **`.stignore` (set on every device; per-device, NOT synced — push to each vault root + rescan):**
+  `(?d)*.sync-conflict-*` **AND `(?d)**/*.sync-conflict-*`** (root form misses nested conflicts),
+  **`(?d)/.git`** (the vault `C:\notes1` is a git repo w/ a local-backup commit task — its `.git`
+  is 53MB/2952 objects and was being replicated to mobile; ignore it), **`(?d)/.stversions`**,
+  `.obsidian/workspace*`, `.obsidian/**/*.log`,
+  **`.obsidian/plugins/remember-cursor-position-enhanced/.device-id.local.json`**,
   `rcp-enhanced-logs`, `sync-health`, `.trash`, livesync `data.json`.
-- **Done:** laptop + tablet (bidirectional, content + cursor-state verified). **Pending:** phone
-  (USB once to enable wireless ADB), 2nd laptop, then retire LiveSync (disable plugin + the
-  CouchDB/bridge/backup tasks).
+- **Done:** laptop + tablet + **phone (2026-06-23)** — all bidirectional, content + cursor-state
+  verified, 0 conflicts. Phone = SM-S936B, vault `/storage/emulated/0/Documents/Test`, RCP-E id
+  `hvmodycj`, keys in `scripts/sync.config.ps1`. **Phone gotcha:** Run Conditions → uncheck
+  "Respect Android battery saving setting" (it was stopping Syncthing on power-save), then FOLLOW
+  RUN CONDITIONS. **Pending:** 2nd laptop (bng1122584x5t3); tablet `.stignore` still needs the
+  `/.git` + nested-conflict additions + a one-time conflict-file cleanup (next time on USB); then
+  retire LiveSync (currently left enabled cluster-wide — disable plugin + the CouchDB/bridge/backup
+  tasks).
 
 ---
 
