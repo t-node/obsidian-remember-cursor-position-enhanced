@@ -184,6 +184,8 @@ export default class RememberCursorPosition extends Plugin {
 	reloadingState = false;
 	/** Stamp of the last force-push we honored, so a single force fires exactly once per device. */
 	lastAppliedForcedAt = 0;
+	/** Per-device label, stored in the local-only id file so it never syncs to other devices. */
+	localDeviceName: string | null = null;
 	scrollListenersAttached = false;
 	debouncedSave: Debouncer<[string, EphemeralState], void>;
 	pendingSavePath: string | null = null;
@@ -237,6 +239,8 @@ export default class RememberCursorPosition extends Plugin {
 	}
 
 	getDeviceLabel(): string {
+		const local = this.localDeviceName?.trim();
+		if (local) return local;
 		const name = this.settings?.deviceName?.trim();
 		return name || this.getDefaultDeviceName();
 	}
@@ -799,7 +803,8 @@ export default class RememberCursorPosition extends Plugin {
 		try {
 			if (await this.app.vault.adapter.exists(path)) {
 				const raw = await this.app.vault.adapter.read(path);
-				const parsed = JSON.parse(raw) as { deviceId?: string };
+				const parsed = JSON.parse(raw) as { deviceId?: string; deviceName?: string };
+				if (typeof parsed.deviceName === 'string') this.localDeviceName = parsed.deviceName;
 				if (parsed.deviceId) return parsed.deviceId;
 			}
 		} catch (e) {
@@ -810,12 +815,29 @@ export default class RememberCursorPosition extends Plugin {
 		try {
 			await this.app.vault.adapter.write(
 				path,
-				JSON.stringify({ deviceId }, null, 2)
+				JSON.stringify({ deviceId, deviceName: this.localDeviceName ?? '' }, null, 2)
 			);
 		} catch (e) {
 			console.warn('[RCP-E] Could not write local device id', e);
 		}
 		return deviceId;
+	}
+
+	/** Save this device's friendly name to the local-only file (never synced) and re-stamp our store
+	 *  so other devices immediately see the new name in confirmations. */
+	async saveLocalDeviceName(name: string): Promise<void> {
+		this.localDeviceName = name;
+		const path = this.localDeviceIdPath();
+		let deviceId = this.settings.deviceId ?? '';
+		try {
+			if (await this.app.vault.adapter.exists(path)) {
+				const parsed = JSON.parse(await this.app.vault.adapter.read(path)) as { deviceId?: string };
+				if (parsed.deviceId) deviceId = parsed.deviceId;
+			}
+		} catch { /* keep settings id */ }
+		await this.app.vault.adapter.write(path, JSON.stringify({ deviceId, deviceName: name }, null, 2));
+		const store = await this.loadOwnDeviceStore();
+		await this.persistOwnDeviceStore(store);
 	}
 
 	private async cleanupLegacyLogsInDir(
@@ -2101,7 +2123,8 @@ export default class RememberCursorPosition extends Plugin {
 		}
 
 		const notice = new Notice('Pushing position… confirming on other devices', 0);
-		const confirmed = new Map<string, string>(); // deviceId -> friendly label
+		const confirmed = new Set<string>(); // deviceIds that have acked
+		const peerLabels = new Map<string, string>(); // deviceId -> raw label (from its store)
 		const labelFor = (s: DeviceStateStore) => s.deviceName?.trim() || s.deviceId;
 		const deadline = Date.now() + FORCE_VERIFY_TIMEOUT_MS;
 
@@ -2111,7 +2134,8 @@ export default class RememberCursorPosition extends Plugin {
 			const stores = await this.loadRemoteDeviceStores();
 			for (const s of stores) {
 				if (s.deviceId === ownId) continue;
-				if (getForceAck(s, hash) >= beat) confirmed.set(s.deviceId, labelFor(s));
+				peerLabels.set(s.deviceId, labelFor(s));
+				if (getForceAck(s, hash) >= beat) confirmed.add(s.deviceId);
 			}
 			notice.setMessage(
 				`Syncing position to your devices… ${confirmed.size}/${peerIds.length} confirmed`
@@ -2119,28 +2143,41 @@ export default class RememberCursorPosition extends Plugin {
 		}
 
 		notice.hide();
-		const confirmedLabels = [...confirmed.values()];
+		// Resolve each peer to a display name, disambiguating any duplicate labels (e.g. two laptops
+		// both still called "Windows Desktop") by appending a short id so the user can tell them apart.
+		const labelOf = (id: string) => peerLabels.get(id) ?? id;
+		const labelCounts = new Map<string, number>();
+		for (const id of peerIds) labelCounts.set(labelOf(id), (labelCounts.get(labelOf(id)) ?? 0) + 1);
+		const display = (id: string) =>
+			(labelCounts.get(labelOf(id)) ?? 0) > 1 ? `${labelOf(id)} (${id.slice(0, 4)})` : labelOf(id);
+
+		const confirmedIds = peerIds.filter((id) => confirmed.has(id));
 		const pendingIds = peerIds.filter((id) => !confirmed.has(id));
+		const confirmedLabels = confirmedIds.map(display);
+		const pendingLabels = pendingIds.map(display);
 
 		this.logger.info('FORCE', 'Force-push verification finished', {
 			notePath,
 			beat,
 			peerCount: peerIds.length,
 			confirmed: confirmedLabels,
-			pending: pendingIds,
+			pending: pendingLabels,
 		});
 
 		if (pendingIds.length === 0) {
 			new Notice(
-				`Position confirmed on all ${peerIds.length} devices ✓ (${confirmedLabels.join(', ')})`,
+				`Position confirmed on all ${peerIds.length} devices ✓\n${confirmedLabels.join(', ')}`,
 				8000
 			);
 			return;
 		}
 		const got = confirmedLabels.length ? confirmedLabels.join(', ') : 'none yet';
 		new Notice(
-			`Position pushed ✓\nConfirmed now: ${got}\n${pendingIds.length} offline — it will be exactly here the moment you open the note there.`,
-			12000
+			`Position pushed ✓\n` +
+			`Confirmed: ${got}\n` +
+			`Waiting on (asleep/closed): ${pendingLabels.join(', ')}\n` +
+			`— it will be exactly there the moment you open the note on it.`,
+			14000
 		);
 	}
 
@@ -3134,17 +3171,17 @@ class SettingTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName('Device name')
 			.setDesc(
-				'Label for this device in log filenames and log lines. ' +
+				'Name for THIS device (per-device — not synced to your others). ' +
 				`Auto-detected: "${this.plugin.getDefaultDeviceName()}". ` +
-				'Set a custom name like "Work PC" or "Personal Phone" so synced logs are easy to tell apart on desktop.'
+				'Set a distinct name like "Master Laptop", "Laptop 2", "Phone", "Tablet" so force-push ' +
+				'confirmations and logs clearly show which device is which.'
 			)
 			.addText((text) =>
 				text
 					.setPlaceholder(this.plugin.getDefaultDeviceName())
-					.setValue(this.plugin.settings.deviceName ?? '')
+					.setValue(this.plugin.localDeviceName ?? '')
 					.onChange(async (value) => {
-						this.plugin.settings.deviceName = value.trim();
-						await this.plugin.saveSettings();
+						await this.plugin.saveLocalDeviceName(value.trim());
 						this.plugin.initLogger();
 						this.plugin.logger.info('SETTINGS', 'deviceName changed', {
 							deviceName: this.plugin.getDeviceLabel(),
