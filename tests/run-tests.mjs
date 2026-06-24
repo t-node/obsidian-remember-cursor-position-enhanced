@@ -181,6 +181,12 @@ function isRegressiveScrollSave(proposed, existing) {
 	return proposed.scroll < existing.scroll - 5 && existing.scroll > 20;
 }
 
+function isDeliberateUserSave(p) {
+	if (p.loadingFile || p.reloadingState) return false;
+	if (p.now < p.restoreGraceUntil) return false;
+	return p.now - p.lastInteractionAt < p.windowMs;
+}
+
 let passed = 0;
 let failed = 0;
 
@@ -476,6 +482,34 @@ test('shouldApplyMergedState applies newer-by-time remote even when local revisi
 		),
 		true
 	);
+});
+
+test('isDeliberateUserSave: true right after a user interaction (deliberate scroll saved)', () => {
+	assert.equal(isDeliberateUserSave({
+		now: 10000, lastInteractionAt: 9000, restoreGraceUntil: 0,
+		loadingFile: false, reloadingState: false, windowMs: 10000,
+	}), true);
+});
+
+test('isDeliberateUserSave: false while loading (load-time scroll-0 guard preserved)', () => {
+	assert.equal(isDeliberateUserSave({
+		now: 10000, lastInteractionAt: 9999, restoreGraceUntil: 0,
+		loadingFile: true, reloadingState: false, windowMs: 10000,
+	}), false);
+});
+
+test('isDeliberateUserSave: false during restore grace (guards preserved)', () => {
+	assert.equal(isDeliberateUserSave({
+		now: 10000, lastInteractionAt: 9999, restoreGraceUntil: 15000,
+		loadingFile: false, reloadingState: false, windowMs: 10000,
+	}), false);
+});
+
+test('isDeliberateUserSave: false when interaction is stale (automatic re-flush still guarded)', () => {
+	assert.equal(isDeliberateUserSave({
+		now: 100000, lastInteractionAt: 9000, restoreGraceUntil: 0,
+		loadingFile: false, reloadingState: false, windowMs: 10000,
+	}), false);
 });
 
 test('explainApplyRejection describes local timestamp win', () => {

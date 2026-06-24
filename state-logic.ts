@@ -310,6 +310,26 @@ export function shouldWatchForRemoteState(
 	return !merged || isWeakTopOfNoteState(merged);
 }
 
+/**
+ * True when a save reflects the user's CURRENT, deliberate editor position — and so must win over
+ * the load-time scroll-0 guard and the cross-device staleness guard. Deliberate = not loading /
+ * reloading, past the restore-grace window, and the user interacted within `windowMs`. During load
+ * or restore (none of those true) the guards still apply, preserving the original protection
+ * against clobbering a real saved position with a bogus scroll-0 reported before the editor is ready.
+ */
+export function isDeliberateUserSave(p: {
+	now: number;
+	lastInteractionAt: number;
+	restoreGraceUntil: number;
+	loadingFile: boolean;
+	reloadingState: boolean;
+	windowMs: number;
+}): boolean {
+	if (p.loadingFile || p.reloadingState) return false;
+	if (p.now < p.restoreGraceUntil) return false;
+	return p.now - p.lastInteractionAt < p.windowMs;
+}
+
 export function shouldApplyMergedState(
 	disk: EphemeralState,
 	applied: EphemeralState | null | undefined

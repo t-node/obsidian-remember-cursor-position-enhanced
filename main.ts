@@ -20,6 +20,7 @@ import {
 	isIgnorableStateListEntry,
 	isValidState,
 	isEphemeralStatesEquals,
+	isDeliberateUserSave,
 	isRegressiveScrollSave,
 	isWeakDefaultScrollSave,
 	isWeakTopOfNoteState,
@@ -1159,7 +1160,21 @@ export default class RememberCursorPosition extends Plugin {
 				lastModified: saveTimestamp,
 			};
 
-			if (existing && (existing.lastModified ?? 0) > saveTimestamp) {
+			// A save that reflects the user's CURRENT, deliberate position must win over the
+			// load-time / staleness guards below (which exist only to suppress a bogus scroll-0
+			// reported before the editor is ready and stale automatic re-flushes). Mirrors the
+			// apply-side active-interaction guard so an intentional scroll — including to the very
+			// top — is saved and respected instead of being snapped back to a synced position.
+			const deliberateUserSave = isDeliberateUserSave({
+				now: Date.now(),
+				lastInteractionAt: this.lastLocalInteractionAt,
+				restoreGraceUntil: this.restoreGraceUntil,
+				loadingFile: this.loadingFile,
+				reloadingState: this.reloadingState,
+				windowMs: ACTIVE_INTERACTION_GUARD_MS,
+			});
+
+			if (!deliberateUserSave && existing && (existing.lastModified ?? 0) > saveTimestamp) {
 				this.logger.warn('SAVE', 'Skip write — merged disk state is newer (likely synced from another device)', {
 					notePath,
 					diskLastModified: existing.lastModified,
@@ -1181,7 +1196,7 @@ export default class RememberCursorPosition extends Plugin {
 				return;
 			}
 
-			if (existing && isWeakDefaultScrollSave(stateToSave, existing)) {
+			if (!deliberateUserSave && existing && isWeakDefaultScrollSave(stateToSave, existing)) {
 				this.logger.warn('SAVE', 'Skip write — weak scroll-0 save would clobber real position on disk', {
 					notePath,
 					diskScroll: existing.scroll,
