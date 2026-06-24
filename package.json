@@ -9,10 +9,7 @@
     "test": "node tests/run-tests.mjs",
     "deploy": "node scripts/deploy.mjs",
     "release": "node scripts/release.mjs",
-    "vault-cleanup": "node scripts/vault-cleanup.mjs",
-    "livesync-setup": "powershell -ExecutionPolicy Bypass -File setup-livesync.ps1",
-    "livesync-mobile": "powershell -ExecutionPolicy Bypass -File setup-livesync-mobile.ps1",
-    "livesync-couchdb": "powershell -ExecutionPolicy Bypass -File scripts/setup-livesync-couchdb.ps1"
+    "vault-cleanup": "node scripts/vault-cleanup.mjs"
   },
   "keywords": [],
   "author": "",

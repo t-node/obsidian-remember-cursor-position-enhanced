@@ -8,16 +8,14 @@
   adb on port 5555 across its Tailscale IP. This script just reconnects to those IPs. After a
   device REBOOT, tcpip mode resets — plug it into USB once and run `-Enable` to turn it back on.
 
-.PARAMETER Doctor   After connecting, run scripts/sync-reset.ps1 -Action doctor.
 .PARAMETER Enable   Run this with a device on USB to (re)enable wireless adb on it, then connect.
 
 .EXAMPLE
   pwsh scripts/adb-net.ps1            # connect to all known devices over Tailscale
-  pwsh scripts/adb-net.ps1 -Doctor   # connect, then full cross-device health report
   pwsh scripts/adb-net.ps1 -Enable   # device on USB -> enable wireless adb on it
 #>
 [CmdletBinding()]
-param([switch]$Doctor, [switch]$Enable)
+param([switch]$Enable)
 . "$PSScriptRoot\_sync-config.ps1"
 
 # Android devices come from scripts\sync.config.ps1 (Tailscale IPs).
@@ -51,8 +49,3 @@ foreach ($d in $Devices) {
 }
 Write-Host "`nadb devices:" -ForegroundColor Cyan
 adb devices | Select-Object -Skip 1 | Where-Object { $_ }
-
-if ($Doctor) {
-	$root = Split-Path $PSScriptRoot -Parent
-	& powershell -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'sync-reset.ps1') -Action doctor
-}
