@@ -187,6 +187,11 @@ function isDeliberateUserSave(p) {
 	return p.now - p.lastInteractionAt < p.windowMs;
 }
 
+function isForceOverride(merged, lastAppliedForcedAt) {
+	if (!merged || typeof merged.forcedAt !== 'number') return false;
+	return merged.forcedAt !== lastAppliedForcedAt;
+}
+
 let passed = 0;
 let failed = 0;
 
@@ -510,6 +515,22 @@ test('isDeliberateUserSave: false when interaction is stale (automatic re-flush 
 		now: 100000, lastInteractionAt: 9000, restoreGraceUntil: 0,
 		loadingFile: false, reloadingState: false, windowMs: 10000,
 	}), false);
+});
+
+test('isForceOverride: true for a fresh force-push (not yet honored)', () => {
+	assert.equal(isForceOverride({ forcedAt: 5000 }, 0), true);
+});
+
+test('isForceOverride: false once that exact force was already honored (no re-yank)', () => {
+	assert.equal(isForceOverride({ forcedAt: 5000 }, 5000), false);
+});
+
+test('isForceOverride: true for a newer force after an earlier one', () => {
+	assert.equal(isForceOverride({ forcedAt: 9000 }, 5000), true);
+});
+
+test('isForceOverride: false for an ordinary (non-forced) merged state', () => {
+	assert.equal(isForceOverride({ scroll: 42, lastModified: 1234 }, 0), false);
 });
 
 test('explainApplyRejection describes local timestamp win', () => {

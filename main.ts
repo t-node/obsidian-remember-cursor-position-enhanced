@@ -22,6 +22,7 @@ import {
 	isValidState,
 	isEphemeralStatesEquals,
 	isDeliberateUserSave,
+	isForceOverride,
 	isRegressiveScrollSave,
 	isWeakDefaultScrollSave,
 	isWeakTopOfNoteState,
@@ -174,6 +175,8 @@ export default class RememberCursorPosition extends Plugin {
 	lastLoadedFileName = '';
 	loadingFile = false;
 	reloadingState = false;
+	/** Stamp of the last force-push we honored, so a single force fires exactly once per device. */
+	lastAppliedForcedAt = 0;
 	scrollListenersAttached = false;
 	debouncedSave: Debouncer<[string, EphemeralState], void>;
 	pendingSavePath: string | null = null;
@@ -1643,6 +1646,32 @@ export default class RememberCursorPosition extends Plugin {
 			return false;
 		}
 
+		// A deliberate force-push overrides every guard below — that's the whole point of the button:
+		// pressing it updates every open screen in real time, even one mid-scroll. Honored once per
+		// force (deduped by stamp), then recorded so it can't re-yank on later re-checks.
+		const forceOverride = isForceOverride(merged, this.lastAppliedForcedAt);
+		if (forceOverride) {
+			const winnerDeviceId = this.lastMergeAnalysis?.winnerDeviceId ?? null;
+			this.lastAppliedForcedAt = merged.forcedAt ?? this.lastAppliedForcedAt;
+			this.logger.info('FORCE', 'Applying force-pushed state (guards bypassed)', {
+				notePath,
+				trigger,
+				triggerFile,
+				winnerDeviceId,
+				forcedAt: merged.forcedAt,
+				state: summarizeState(merged),
+			});
+			await this.applyScrollState(notePath, merged, trigger, winnerDeviceId);
+			void this.writeSyncDiagnostic('apply-accepted', {
+				notePath,
+				trigger: `${trigger}/force`,
+				winnerDeviceId,
+				state: summarizeState(merged),
+				editorAfter: summarizeState(this.getEphemeralState()),
+			});
+			return true;
+		}
+
 		// Active-reading guard (skew-proof, local clock only): if the user has scrolled/moved on
 		// THIS note within the guard window, a remote device's position must not yank it away.
 		// Note-open restores use a different path (restoreNoteState), so first-open is unaffected.
@@ -2023,7 +2052,7 @@ export default class RememberCursorPosition extends Plugin {
 		}
 		const merged = await this.readMergedNoteState(notePath);
 		const beat = Math.max(Date.now(), merged?.lastModified ?? 0) + 2000;
-		const forced: EphemeralState = { ...live, filePath: notePath, lastModified: beat };
+		const forced: EphemeralState = { ...live, filePath: notePath, lastModified: beat, forcedAt: beat };
 		let store = await this.loadOwnDeviceStore();
 		store = upsertNoteInStore(store, notePath, forced);
 		await this.persistOwnDeviceStore(store);

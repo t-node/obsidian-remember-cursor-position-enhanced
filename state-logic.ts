@@ -10,6 +10,10 @@ export interface EphemeralState {
 	revision?: number;
 	/** Nearest heading line above cursor (cross-device anchor). */
 	anchorLine?: number;
+	/** Set ONLY by a deliberate force-push. Tells receivers to apply this state immediately,
+	 *  overriding the active-reading and weak-scroll guards. Value is the push timestamp, used
+	 *  by receivers to dedupe (honor each force exactly once). */
+	forcedAt?: number;
 }
 
 export interface TaggedNoteState extends EphemeralState {
@@ -328,6 +332,18 @@ export function isDeliberateUserSave(p: {
 	if (p.loadingFile || p.reloadingState) return false;
 	if (p.now < p.restoreGraceUntil) return false;
 	return p.now - p.lastInteractionAt < p.windowMs;
+}
+
+/** A force-push carries a `forcedAt` stamp. The receiver honors it exactly once — deduped by the
+ *  stamp value (skew-proof: it's an identity check, not a clock comparison) — and when honored it
+ *  overrides the active-reading and weak-scroll guards. This is what makes "force" mean force:
+ *  pressing the button updates every open screen in real time, even one mid-scroll. */
+export function isForceOverride(
+	merged: EphemeralState | null | undefined,
+	lastAppliedForcedAt: number
+): boolean {
+	if (!merged || typeof merged.forcedAt !== 'number') return false;
+	return merged.forcedAt !== lastAppliedForcedAt;
 }
 
 export function shouldApplyMergedState(
