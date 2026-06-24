@@ -48,6 +48,8 @@ import {
 	RECOMMENDED_STATE_DIR,
 	pruneDeviceStore,
 	upsertNoteInStore,
+	recordForceAck,
+	getForceAck,
 	type DeviceStateStore,
 	type StateFileAdapter,
 } from './device-store';
@@ -93,6 +95,10 @@ const ACTIVE_INTERACTION_GUARD_MS = 10000;
 const SYNC_RETRY_RESTORE_MS = 3000;
 const AGGRESSIVE_SYNC_RETRY_RESTORE_MS = 1500;
 const CROSS_DEVICE_SYNC_WATCH_MS = 60000;
+// Force-push confirmation: poll peer acks every POLL ms, up to TIMEOUT (covers online devices on
+// the same network; offline ones are reported as pending rather than waited on indefinitely).
+const FORCE_VERIFY_POLL_MS = 1500;
+const FORCE_VERIFY_TIMEOUT_MS = 15000;
 const SYNC_RETRY_DELAYS_AGGRESSIVE = [1500, 4000, 8000, 15000, 30000, 60000];
 const SYNC_RETRY_DELAYS_NORMAL = [3000, 7000, 12000, 20000, 45000, 60000];
 const LEGACY_DB_FILENAME = '.obsidian/plugins/remember-cursor-position/cursor-positions.json';
@@ -1012,9 +1018,10 @@ export default class RememberCursorPosition extends Plugin {
 
 	async persistOwnDeviceStore(store: DeviceStateStore): Promise<void> {
 		await this.ensureStateDir();
-		const path = getDeviceStorePath(this.settings.stateDir, store.deviceId);
-		await this.app.vault.adapter.write(path, JSON.stringify(store));
-		this.ownDeviceStoreCache = store;
+		const stamped: DeviceStateStore = { ...store, deviceName: this.getDeviceLabel() };
+		const path = getDeviceStorePath(this.settings.stateDir, stamped.deviceId);
+		await this.app.vault.adapter.write(path, JSON.stringify(stamped));
+		this.ownDeviceStoreCache = stamped;
 	}
 
 	setCrossDeviceSyncWatch(notePath: string): void {
@@ -1828,6 +1835,9 @@ export default class RememberCursorPosition extends Plugin {
 			if (isRemoteDeviceStore) {
 				this.invalidateRemoteDeviceStoreCache(remoteDeviceId);
 				await this.readStateFile(stateFilePath);
+				// Acknowledge any force-pushes this peer carries, even if that note isn't open here —
+				// this is what lets the pushing device confirm the force actually landed on us.
+				await this.ackForcesFromRemoteStore(stateFilePath);
 				const activeFile = this.app.workspace.getActiveFile()?.path;
 				if (!activeFile || this.loadingFile) {
 					this.logger.debug('SYNC', 'Remote device store changed — no active note', {
@@ -2058,11 +2068,96 @@ export default class RememberCursorPosition extends Plugin {
 		await this.persistOwnDeviceStore(store);
 		this.lastEphemeralState = { ...forced };
 		this.lastLocalInteractionAt = Date.now();
+		this.lastAppliedForcedAt = beat; // don't let our own push re-apply to ourselves
 		this.logger.info('FORCE', 'Force-pushed position to all devices', {
 			notePath,
 			forced: summarizeState(forced),
 		});
-		new Notice('Pushed this device’s position to all devices ✓ (they jump to it when open & awake).');
+		await this.verifyForcePush(notePath, beat);
+	}
+
+	/** After a force-push, watch the peer device stores until each one acknowledges the exact push
+	 *  (proof it landed there), giving live progress and a final, truthful confirmation. Peers that
+	 *  are offline can't ack until they reopen — we say so plainly rather than claiming success. */
+	private async verifyForcePush(notePath: string, beat: number): Promise<void> {
+		const hash = getFileHash(notePath);
+		const ownId = this.settings.deviceId ?? 'unknown';
+		const peerIds = (await this.listDeviceStoreFiles())
+			.map((f) => (f.split('/').pop() ?? '').replace(/\.json$/i, ''))
+			.filter((id) => id && id !== ownId);
+
+		if (peerIds.length === 0) {
+			new Notice('Position saved ✓ (no other devices have synced yet).');
+			return;
+		}
+
+		const notice = new Notice('Pushing position… confirming on other devices', 0);
+		const confirmed = new Map<string, string>(); // deviceId -> friendly label
+		const labelFor = (s: DeviceStateStore) => s.deviceName?.trim() || s.deviceId;
+		const deadline = Date.now() + FORCE_VERIFY_TIMEOUT_MS;
+
+		while (Date.now() < deadline && confirmed.size < peerIds.length) {
+			await new Promise((r) => window.setTimeout(r, FORCE_VERIFY_POLL_MS));
+			this.remoteDeviceStoresCache.clear();
+			const stores = await this.loadRemoteDeviceStores();
+			for (const s of stores) {
+				if (s.deviceId === ownId) continue;
+				if (getForceAck(s, hash) >= beat) confirmed.set(s.deviceId, labelFor(s));
+			}
+			notice.setMessage(
+				`Syncing position to your devices… ${confirmed.size}/${peerIds.length} confirmed`
+			);
+		}
+
+		notice.hide();
+		const confirmedLabels = [...confirmed.values()];
+		const pendingIds = peerIds.filter((id) => !confirmed.has(id));
+
+		this.logger.info('FORCE', 'Force-push verification finished', {
+			notePath,
+			beat,
+			peerCount: peerIds.length,
+			confirmed: confirmedLabels,
+			pending: pendingIds,
+		});
+
+		if (pendingIds.length === 0) {
+			new Notice(
+				`Position confirmed on all ${peerIds.length} devices ✓ (${confirmedLabels.join(', ')})`,
+				8000
+			);
+			return;
+		}
+		const got = confirmedLabels.length ? confirmedLabels.join(', ') : 'none yet';
+		new Notice(
+			`Position pushed ✓\nConfirmed now: ${got}\n${pendingIds.length} offline — it will be exactly here the moment you open the note there.`,
+			12000
+		);
+	}
+
+	/** When a peer's store arrives, ack any force-pushes it carries so the pusher can confirm. */
+	private async ackForcesFromRemoteStore(stateFilePath: string): Promise<void> {
+		try {
+			const adapter = this.getStorageAdapter();
+			if (!(await adapter.exists(stateFilePath))) return;
+			const remote = parseDeviceStoreJson(await adapter.read(stateFilePath));
+			if (!remote) return;
+			let own = await this.loadOwnDeviceStore();
+			let changed = false;
+			for (const [hash, entry] of Object.entries(remote.notes)) {
+				const forcedAt = entry.forcedAt;
+				if (typeof forcedAt === 'number' && forcedAt > getForceAck(own, hash)) {
+					own = recordForceAck(own, hash, forcedAt);
+					changed = true;
+				}
+			}
+			if (changed) {
+				await this.persistOwnDeviceStore(own);
+				this.logger.debug('FORCE', 'Acked force-push(es) from peer store', { stateFilePath });
+			}
+		} catch (e) {
+			this.logger.warn('FORCE', 'Failed to ack forces from peer store', { stateFilePath, error: String(e) });
+		}
 	}
 
 	async forceRestoreCurrentNote(): Promise<void> {

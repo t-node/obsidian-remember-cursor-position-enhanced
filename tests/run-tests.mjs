@@ -192,6 +192,19 @@ function isForceOverride(merged, lastAppliedForcedAt) {
 	return merged.forcedAt !== lastAppliedForcedAt;
 }
 
+function getForceAck(store, noteHash) {
+	return store.acks?.[noteHash] ?? 0;
+}
+
+function recordForceAck(store, noteHash, forcedAt) {
+	if (forcedAt <= getForceAck(store, noteHash)) return store;
+	return {
+		...store,
+		storeRevision: (store.storeRevision ?? 0) + 1,
+		acks: { ...(store.acks ?? {}), [noteHash]: forcedAt },
+	};
+}
+
 let passed = 0;
 let failed = 0;
 
@@ -531,6 +544,27 @@ test('isForceOverride: true for a newer force after an earlier one', () => {
 
 test('isForceOverride: false for an ordinary (non-forced) merged state', () => {
 	assert.equal(isForceOverride({ scroll: 42, lastModified: 1234 }, 0), false);
+});
+
+test('recordForceAck: records a new ack and bumps storeRevision', () => {
+	const s = recordForceAck({ storeRevision: 3, notes: {} }, 'h1', 5000);
+	assert.equal(getForceAck(s, 'h1'), 5000);
+	assert.equal(s.storeRevision, 4);
+});
+
+test('recordForceAck: no-op (same object) when stamp already acked — no pointless re-write', () => {
+	const before = { storeRevision: 4, notes: {}, acks: { h1: 5000 } };
+	const after = recordForceAck(before, 'h1', 5000);
+	assert.equal(after, before);
+});
+
+test('recordForceAck: a newer force for the same note supersedes the old ack', () => {
+	const s = recordForceAck({ storeRevision: 1, notes: {}, acks: { h1: 5000 } }, 'h1', 9000);
+	assert.equal(getForceAck(s, 'h1'), 9000);
+});
+
+test('getForceAck: 0 when the note was never force-pushed', () => {
+	assert.equal(getForceAck({ storeRevision: 0, notes: {} }, 'h1'), 0);
 });
 
 test('explainApplyRejection describes local timestamp win', () => {

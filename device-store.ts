@@ -25,6 +25,11 @@ export interface DeviceStateStore {
 	/** Increments on every write to this file. */
 	storeRevision: number;
 	notes: Record<string, NoteStateEntry>;
+	/** Friendly label of this device (e.g. "phone"), so peers can name it in confirmations. */
+	deviceName?: string;
+	/** noteHash -> highest force-push stamp this device has received/processed. Lets the pusher
+	 *  confirm a force actually landed on each peer (not just that the file was written). */
+	acks?: Record<string, number>;
 }
 
 export function createEmptyDeviceStore(deviceId: string): DeviceStateStore {
@@ -65,6 +70,8 @@ export function parseDeviceStoreJson(raw: string): DeviceStateStore | null {
 			deviceId: parsed.deviceId,
 			storeRevision: parsed.storeRevision ?? 0,
 			notes: parsed.notes ?? {},
+			deviceName: parsed.deviceName,
+			acks: parsed.acks ?? {},
 		};
 	} catch {
 		return null;
@@ -130,6 +137,26 @@ export function upsertNoteInStore(
 			...store.notes,
 			[hash]: entry,
 		},
+	};
+}
+
+/** Highest force-push stamp this store has acknowledged for a note (0 = none). */
+export function getForceAck(store: DeviceStateStore, noteHash: string): number {
+	return store.acks?.[noteHash] ?? 0;
+}
+
+/** Record that this device has received a force-push for a note. Returns the same store object
+ *  unchanged if the stamp was already acknowledged (so it never triggers a pointless re-write). */
+export function recordForceAck(
+	store: DeviceStateStore,
+	noteHash: string,
+	forcedAt: number
+): DeviceStateStore {
+	if (forcedAt <= getForceAck(store, noteHash)) return store;
+	return {
+		...store,
+		storeRevision: (store.storeRevision ?? 0) + 1,
+		acks: { ...(store.acks ?? {}), [noteHash]: forcedAt },
 	};
 }
 
