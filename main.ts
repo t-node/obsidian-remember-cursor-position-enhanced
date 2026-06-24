@@ -437,6 +437,16 @@ export default class RememberCursorPosition extends Plugin {
 				void this.forcePushCurrentNote();
 			});
 
+			// Also render the button in the TOP CORNER of every note (the view header), so you can
+			// push your position from right where you're reading — on desktop and mobile alike.
+			const ensureForcePushAction = () => {
+				const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+				if (view) this.addForcePushAction(view);
+			};
+			this.registerEvent(this.app.workspace.on('active-leaf-change', ensureForcePushAction));
+			this.registerEvent(this.app.workspace.on('layout-change', ensureForcePushAction));
+			this.app.workspace.onLayoutReady(ensureForcePushAction);
+
 			this.registerEvent(
 				this.app.workspace.on('file-open', (file) => {
 					if (file) {
@@ -1959,6 +1969,17 @@ export default class RememberCursorPosition extends Plugin {
 			this.lastEphemeralState = { ...enriched, filePath: fileName, lastModified: Date.now() };
 			this.queueSave(fileName, this.lastEphemeralState);
 		}
+	}
+
+	private forcePushActionViews = new WeakSet<MarkdownView>();
+
+	// Add the "force to all devices" button to a note's top-corner header (once per view instance).
+	private addForcePushAction(view: MarkdownView): void {
+		if (this.forcePushActionViews.has(view)) return;
+		view.addAction('upload-cloud', 'Force this note’s position to all devices', () => {
+			void this.forcePushCurrentNote();
+		});
+		this.forcePushActionViews.add(view);
 	}
 
 	// Make THIS device authoritative for the current note: stamp its position with a timestamp that
