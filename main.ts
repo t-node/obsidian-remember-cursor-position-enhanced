@@ -2437,7 +2437,7 @@ export default class RememberCursorPosition extends Plugin {
 
 	getEphemeralState(): EphemeralState {
 		const state: EphemeralState = {};
-		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+		const view = this.getTrackedMarkdownView();
 		if (!view) return state;
 
 		let scroll = view.currentMode?.getScroll();
@@ -2536,7 +2536,7 @@ export default class RememberCursorPosition extends Plugin {
 		state: EphemeralState,
 		options?: { crossDevice?: boolean; sourceDeviceId?: string | null }
 	) {
-		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+		const view = this.getTrackedMarkdownView();
 		const editor = this.getEditor();
 		const anchorLine = getAnchorLineFromState(state);
 		const crossDevice = options?.crossDevice ?? false;
@@ -2585,7 +2585,7 @@ export default class RememberCursorPosition extends Plugin {
 				mode.applyScroll(state.scroll);
 			}
 			requestAnimationFrame(() => {
-				const retryView = this.app.workspace.getActiveViewOfType(MarkdownView);
+				const retryView = this.getTrackedMarkdownView();
 				if (!retryView || retryView.file?.path !== this.lastLoadedFileName) return;
 				const retryMode = retryView.currentMode;
 				if (retryMode && typeof retryMode.applyScroll === 'function') {
@@ -2626,8 +2626,25 @@ export default class RememberCursorPosition extends Plugin {
 		return !!view && view.file?.path === filePath;
 	}
 
+	// The markdown view to read/write for the note we're tracking. Prefer the active view, but if
+	// focus has moved off the editor (to a sidebar, another window, a non-markdown tab, etc.) the
+	// active view is null and the plugin would otherwise go "blind" — unable to read the scroll to
+	// save it, or to apply an incoming position. In that case fall back to the open markdown pane
+	// showing the tracked note, so sync keeps working regardless of which pane currently has focus.
+	private getTrackedMarkdownView(): MarkdownView | null {
+		const active = this.app.workspace.getActiveViewOfType(MarkdownView);
+		if (active) return active;
+		const tracked = this.lastLoadedFileName;
+		if (!tracked) return null;
+		for (const leaf of this.app.workspace.getLeavesOfType('markdown')) {
+			const v = leaf.view;
+			if (v instanceof MarkdownView && v.file?.path === tracked) return v;
+		}
+		return null;
+	}
+
 	private getEditor(): Editor | undefined {
-		return this.app.workspace.getActiveViewOfType(MarkdownView)?.editor;
+		return this.getTrackedMarkdownView()?.editor;
 	}
 
 	async loadSettings() {
