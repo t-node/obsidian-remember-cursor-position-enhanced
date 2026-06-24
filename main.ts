@@ -50,6 +50,7 @@ import {
 	upsertNoteInStore,
 	recordForceAck,
 	getForceAck,
+	isSyncConflictFileName,
 	type DeviceStateStore,
 	type StateFileAdapter,
 } from './device-store';
@@ -348,6 +349,9 @@ export default class RememberCursorPosition extends Plugin {
 			this.registerLegacyLogGuard();
 			await this.runStorageMaintenance();
 			await this.pruneStates();
+			// Ack any force-pushes that arrived while this device was closed/asleep, so the pushing
+			// device gets confirmation even when the file was already waiting at startup (no live event).
+			await this.reconcileForceAcks();
 
 			this.addSettingTab(new SettingTab(this.app, this));
 
@@ -516,6 +520,9 @@ export default class RememberCursorPosition extends Plugin {
 					this.logger.info('EVENT', 'App backgrounded — flushing current note');
 					void this.flushCurrentNote(true);
 					void this.writeHealthSnapshot('background');
+				} else if (document.visibilityState === 'visible') {
+					// On resume, ack any force-push that arrived while we were suspended (mobile).
+					void this.reconcileForceAcks();
 				}
 			});
 
@@ -999,6 +1006,7 @@ export default class RememberCursorPosition extends Plugin {
 		for (const filePath of files) {
 			const name = filePath.split('/').pop() ?? '';
 			if (!isDeviceStoreFileName(name)) continue;
+			if (isSyncConflictFileName(name) || name.startsWith('~syncthing~')) continue;
 			const id = name.replace(/\.json$/i, '');
 			if (id === ownId) continue;
 			const cached = this.remoteDeviceStoresCache.get(id);
@@ -1062,6 +1070,7 @@ export default class RememberCursorPosition extends Plugin {
 		const files = await adapter.listFiles(this.settings.stateDir);
 		return files.filter((f) => {
 			const name = f.split('/').pop() ?? '';
+			if (isSyncConflictFileName(name) || name.startsWith('~syncthing~')) return false;
 			return isDeviceStoreFileName(name);
 		});
 	}
@@ -2133,6 +2142,34 @@ export default class RememberCursorPosition extends Plugin {
 			`Position pushed ✓\nConfirmed now: ${got}\n${pendingIds.length} offline — it will be exactly here the moment you open the note there.`,
 			12000
 		);
+	}
+
+	/** Scan all peer stores for force-pushes and ack any not yet acknowledged. Run at startup and on
+	 *  app-resume so a device that found a push waiting (no live file event) still confirms it. */
+	async reconcileForceAcks(): Promise<void> {
+		try {
+			this.remoteDeviceStoresCache.clear();
+			const stores = await this.loadRemoteDeviceStores();
+			const ownId = this.settings.deviceId ?? 'unknown';
+			let own = await this.loadOwnDeviceStore();
+			let changed = false;
+			for (const s of stores) {
+				if (s.deviceId === ownId) continue;
+				for (const [hash, entry] of Object.entries(s.notes)) {
+					const forcedAt = entry.forcedAt;
+					if (typeof forcedAt === 'number' && forcedAt > getForceAck(own, hash)) {
+						own = recordForceAck(own, hash, forcedAt);
+						changed = true;
+					}
+				}
+			}
+			if (changed) {
+				await this.persistOwnDeviceStore(own);
+				this.logger.info('FORCE', 'Reconciled force-push acks at load/resume');
+			}
+		} catch (e) {
+			this.logger.warn('FORCE', 'reconcileForceAcks failed', { error: String(e) });
+		}
 	}
 
 	/** When a peer's store arrives, ack any force-pushes it carries so the pusher can confirm. */
