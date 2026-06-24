@@ -12,6 +12,7 @@ import {
 	Debouncer,
 	Notice,
 	requestUrl,
+	setIcon,
 } from 'obsidian';
 import {
 	EphemeralState,
@@ -437,15 +438,14 @@ export default class RememberCursorPosition extends Plugin {
 				void this.forcePushCurrentNote();
 			});
 
-			// Also render the button in the TOP CORNER of every note (the view header), so you can
-			// push your position from right where you're reading — on desktop and mobile alike.
-			const ensureForcePushAction = () => {
-				const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (view) this.addForcePushAction(view);
-			};
-			this.registerEvent(this.app.workspace.on('active-leaf-change', ensureForcePushAction));
-			this.registerEvent(this.app.workspace.on('layout-change', ensureForcePushAction));
-			this.app.workspace.onLayoutReady(ensureForcePushAction);
+			// A big floating button pinned to the SAME spot (bottom-right) on every device — laptop,
+			// phone, tablet — so the force action is instantly visible and tappable while reading,
+			// no hunting for it. Shown only while a note is open.
+			this.setupForcePushFab();
+			const refreshFab = () => this.updateForcePushFab();
+			this.registerEvent(this.app.workspace.on('active-leaf-change', refreshFab));
+			this.registerEvent(this.app.workspace.on('layout-change', refreshFab));
+			this.app.workspace.onLayoutReady(refreshFab);
 
 			this.registerEvent(
 				this.app.workspace.on('file-open', (file) => {
@@ -1971,15 +1971,38 @@ export default class RememberCursorPosition extends Plugin {
 		}
 	}
 
-	private forcePushActionViews = new WeakSet<MarkdownView>();
+	private forcePushFab: HTMLElement | null = null;
 
-	// Add the "force to all devices" button to a note's top-corner header (once per view instance).
-	private addForcePushAction(view: MarkdownView): void {
-		if (this.forcePushActionViews.has(view)) return;
-		view.addAction('upload-cloud', 'Force this note’s position to all devices', () => {
+	// Create the floating force button once: pinned bottom-right, big and high-contrast so it stands
+	// out identically on laptop, phone, and tablet. Injects its CSS and cleans up on unload.
+	private setupForcePushFab(): void {
+		const style = document.createElement('style');
+		style.textContent =
+			'.rcp-force-fab{position:fixed;right:16px;bottom:96px;width:54px;height:54px;border-radius:50%;' +
+			'background:var(--interactive-accent);color:var(--text-on-accent);display:none;align-items:center;' +
+			'justify-content:center;box-shadow:0 4px 14px rgba(0,0,0,.45);z-index:99999;cursor:pointer;' +
+			'-webkit-tap-highlight-color:transparent;border:2px solid var(--background-primary)}' +
+			'.rcp-force-fab:active{transform:scale(.9)}.rcp-force-fab svg{width:28px;height:28px}';
+		document.head.appendChild(style);
+		const btn = document.body.createDiv({ cls: 'rcp-force-fab' });
+		setIcon(btn, 'upload-cloud');
+		btn.setAttribute('aria-label', 'Force this note’s position to all devices');
+		btn.addEventListener('click', () => {
 			void this.forcePushCurrentNote();
 		});
-		this.forcePushActionViews.add(view);
+		this.forcePushFab = btn;
+		this.register(() => {
+			btn.remove();
+			style.remove();
+		});
+		this.updateForcePushFab();
+	}
+
+	// Show the floating button only while a markdown note is open.
+	private updateForcePushFab(): void {
+		if (!this.forcePushFab) return;
+		const onNote = !!this.app.workspace.getActiveViewOfType(MarkdownView);
+		this.forcePushFab.style.display = onNote ? 'flex' : 'none';
 	}
 
 	// Make THIS device authoritative for the current note: stamp its position with a timestamp that
