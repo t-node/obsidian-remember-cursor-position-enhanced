@@ -10,6 +10,7 @@ export type LogCategory =
 	| 'EVENT'
 	| 'STATE'
 	| 'SETTINGS'
+	| 'FORCE'
 	| 'ERROR';
 
 export interface LoggerOptions {

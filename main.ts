@@ -423,6 +423,20 @@ export default class RememberCursorPosition extends Plugin {
 				},
 			});
 
+			this.addCommand({
+				id: 'force-push-position',
+				name: 'Force THIS device’s position to all devices (current note)',
+				callback: () => {
+					void this.forcePushCurrentNote();
+				},
+			});
+
+			// Clickable button in the left ribbon: make this device the source of truth for the
+			// note you're on. Stamps a timestamp that beats every other device so the merge picks it.
+			this.addRibbonIcon('upload-cloud', 'Force this device’s cursor position to all devices', () => {
+				void this.forcePushCurrentNote();
+			});
+
 			this.registerEvent(
 				this.app.workspace.on('file-open', (file) => {
 					if (file) {
@@ -1945,6 +1959,37 @@ export default class RememberCursorPosition extends Plugin {
 			this.lastEphemeralState = { ...enriched, filePath: fileName, lastModified: Date.now() };
 			this.queueSave(fileName, this.lastEphemeralState);
 		}
+	}
+
+	// Make THIS device authoritative for the current note: stamp its position with a timestamp that
+	// beats every other device (clock-skew-proof) and write it to our own store, bypassing the
+	// normal save guards. The cross-device merge then picks it everywhere — other devices jump to it
+	// when that note is open and the app is awake (mobile applies on next foreground).
+	async forcePushCurrentNote(): Promise<void> {
+		const file = this.app.workspace.getActiveFile();
+		if (!file || !this.shouldTrackFile(file)) {
+			new Notice('RCP-E: open a note first, then press to push its position.');
+			return;
+		}
+		const notePath = file.path;
+		const live = this.getEphemeralState();
+		if (!isValidState(live)) {
+			new Notice('RCP-E: no readable position — click into the note text, then press again.');
+			return;
+		}
+		const merged = await this.readMergedNoteState(notePath);
+		const beat = Math.max(Date.now(), merged?.lastModified ?? 0) + 2000;
+		const forced: EphemeralState = { ...live, filePath: notePath, lastModified: beat };
+		let store = await this.loadOwnDeviceStore();
+		store = upsertNoteInStore(store, notePath, forced);
+		await this.persistOwnDeviceStore(store);
+		this.lastEphemeralState = { ...forced };
+		this.lastLocalInteractionAt = Date.now();
+		this.logger.info('FORCE', 'Force-pushed position to all devices', {
+			notePath,
+			forced: summarizeState(forced),
+		});
+		new Notice('Pushed this device’s position to all devices ✓ (they jump to it when open & awake).');
 	}
 
 	async forceRestoreCurrentNote(): Promise<void> {
