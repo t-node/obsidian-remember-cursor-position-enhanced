@@ -1168,6 +1168,13 @@ export default class RememberCursorPosition extends Plugin {
 					proposedScroll: stateToSave.scroll,
 					deviceFile: stateFilePath,
 				});
+				void this.writeSyncDiagnostic('save-skipped', {
+					notePath, reason: 'disk-state-newer',
+					diskScroll: existing.scroll, proposedScroll: stateToSave.scroll,
+					diskLastModified: existing.lastModified, proposedLastModified: saveTimestamp,
+					winnerDeviceId: this.lastMergeAnalysis?.winnerDeviceId,
+					editorNow: summarizeState(this.getEphemeralState()),
+				});
 				if (notePath === this.lastLoadedFileName) {
 					this.lastEphemeralState = existing;
 				}
@@ -1180,6 +1187,11 @@ export default class RememberCursorPosition extends Plugin {
 					diskScroll: existing.scroll,
 					proposedScroll: stateToSave.scroll,
 					deviceFile: stateFilePath,
+				});
+				void this.writeSyncDiagnostic('save-skipped', {
+					notePath, reason: 'weak-scroll-0-would-clobber',
+					diskScroll: existing.scroll, proposedScroll: stateToSave.scroll,
+					editorNow: summarizeState(this.getEphemeralState()),
 				});
 				return;
 			}
@@ -1195,6 +1207,11 @@ export default class RememberCursorPosition extends Plugin {
 						(this.crossDeviceSyncWatchUntil.get(notePath) ?? 0) - Date.now(),
 					deviceFile: stateFilePath,
 				});
+				void this.writeSyncDiagnostic('save-skipped', {
+					notePath, reason: 'weak-top-while-watching-remote',
+					proposedScroll: stateToSave.scroll,
+					editorNow: summarizeState(this.getEphemeralState()),
+				});
 				return;
 			}
 
@@ -1209,6 +1226,11 @@ export default class RememberCursorPosition extends Plugin {
 					proposedScroll: stateToSave.scroll,
 					graceMsRemaining: this.restoreGraceUntil - Date.now(),
 				});
+				void this.writeSyncDiagnostic('save-skipped', {
+					notePath, reason: 'regressive-during-restore-grace',
+					diskScroll: existing.scroll, proposedScroll: stateToSave.scroll,
+					editorNow: summarizeState(this.getEphemeralState()),
+				});
 				return;
 			}
 
@@ -1218,6 +1240,12 @@ export default class RememberCursorPosition extends Plugin {
 					diskScroll: existing.scroll,
 					proposedScroll: stateToSave.scroll,
 					deviceFile: stateFilePath,
+				});
+				void this.writeSyncDiagnostic('save-skipped', {
+					notePath, reason: 'regressive-scroll-vs-disk',
+					diskScroll: existing.scroll, proposedScroll: stateToSave.scroll,
+					diskLastModified: existing.lastModified, proposedLastModified: saveTimestamp,
+					editorNow: summarizeState(this.getEphemeralState()),
 				});
 				return;
 			}
@@ -1489,8 +1517,8 @@ export default class RememberCursorPosition extends Plugin {
 				pluginVersion: this.manifest.version,
 				...data,
 			});
-			if (events.length > 30) {
-				events = events.slice(events.length - 30);
+			if (events.length > 120) {
+				events = events.slice(events.length - 120);
 			}
 			await this.app.vault.adapter.write(
 				path,
@@ -1613,15 +1641,19 @@ export default class RememberCursorPosition extends Plugin {
 				applied: summarizeState(this.lastEphemeralState),
 				editorNow,
 			});
-			void this.writeSyncDiagnostic('apply-rejected', {
-				notePath,
-				trigger,
-				reason,
-				winnerDeviceId: this.lastMergeAnalysis?.winnerDeviceId,
-				incoming: summarizeState(merged),
-				applied: summarizeState(this.lastEphemeralState),
-				editorNow,
-			});
+			// Skip the benign, high-frequency "already equal" rejections so the bounded diag
+			// buffer keeps the meaningful events (real applies + save-skips) instead of noise.
+			if (!reason.includes('already equal')) {
+				void this.writeSyncDiagnostic('apply-rejected', {
+					notePath,
+					trigger,
+					reason,
+					winnerDeviceId: this.lastMergeAnalysis?.winnerDeviceId,
+					incoming: summarizeState(merged),
+					applied: summarizeState(this.lastEphemeralState),
+					editorNow,
+				});
+			}
 			return false;
 		}
 
