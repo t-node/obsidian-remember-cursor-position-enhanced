@@ -2129,7 +2129,7 @@ export default class RememberCursorPosition extends Plugin {
 		}
 
 		this.activeForceBeat = beat;
-		const notice = new Notice('Pushing position… confirming on your devices', 0);
+		const notice = new Notice('Sending your position to your devices…', 0);
 		const confirmed = new Set<string>(); // deviceIds that have acked
 		const peerLabels = new Map<string, string>(); // deviceId -> raw label (from its store)
 		const labelFor = (s: DeviceStateStore) => s.deviceName?.trim() || s.deviceId;
@@ -2155,7 +2155,7 @@ export default class RememberCursorPosition extends Plugin {
 		while (Date.now() < deadline && confirmed.size < peerIds.length) {
 			await new Promise((r) => window.setTimeout(r, FORCE_VERIFY_POLL_MS));
 			await scan();
-			notice.setMessage(`Syncing position to your devices… ${confirmed.size}/${peerIds.length} confirmed`);
+			notice.setMessage(`Sending your position… ${confirmed.size}/${peerIds.length} devices confirmed`);
 		}
 		notice.hide();
 
@@ -2167,17 +2167,17 @@ export default class RememberCursorPosition extends Plugin {
 		});
 
 		if (pendingIds().length === 0) {
-			new Notice(`Position confirmed on all ${peerIds.length} devices ✓\n${peerIds.map(display).join(', ')}`, 8000);
+			new Notice(`✅ Confirmed — all ${peerIds.length} devices have this position\n${peerIds.map(display).join(', ')}`, 8000);
 			return;
 		}
 
 		const confirmedNow = peerIds.filter((id) => confirmed.has(id)).map(display);
 		new Notice(
 			`Position pushed ✓\n` +
-			`Confirmed: ${confirmedNow.length ? confirmedNow.join(', ') : 'none yet'}\n` +
-			`Still confirming: ${pendingIds().map(display).join(', ')}\n` +
-			`(a device only acks while its Obsidian is open — I'll keep checking)`,
-			12000
+			`✅ Confirmed (read it): ${confirmedNow.length ? confirmedNow.join(', ') : '— none yet'}\n` +
+			`📤 Sent, awaiting open: ${pendingIds().map(display).join(', ')}\n` +
+			`Your position is saved for them — each jumps to it the instant its Obsidian is open. No need to resend; I'll keep checking.`,
+			14000
 		);
 
 		// Phase 2 — keep confirming quietly; a slow-but-awake device gets a follow-up acknowledgement.
@@ -2185,14 +2185,14 @@ export default class RememberCursorPosition extends Plugin {
 		while (Date.now() < bgDeadline && pendingIds().length > 0 && this.activeForceBeat === beat) {
 			await new Promise((r) => window.setTimeout(r, FORCE_VERIFY_BG_POLL_MS));
 			if (this.activeForceBeat !== beat) return; // a newer push superseded this watch
-			const before = confirmed.size;
+			const wasConfirmed = new Set(confirmed);
 			await scan();
-			if (confirmed.size > before) {
+			const newlyConfirmed = peerIds.filter((id) => confirmed.has(id) && !wasConfirmed.has(id)).map(display);
+			if (newlyConfirmed.length > 0) {
 				if (pendingIds().length === 0) {
-					new Notice(`All devices now have your position ✓\n${peerIds.map(display).join(', ')}`, 8000);
+					new Notice(`✅ All ${peerIds.length} devices now have this position\n${peerIds.map(display).join(', ')}`, 8000);
 				} else {
-					const justNow = peerIds.filter((id) => confirmed.has(id)).map(display);
-					new Notice(`Confirmed: ${justNow.join(', ')} (${confirmed.size}/${peerIds.length}) ✓`, 6000);
+					new Notice(`✅ ${newlyConfirmed.join(', ')} now confirmed (${confirmed.size}/${peerIds.length})`, 6000);
 				}
 			}
 		}
