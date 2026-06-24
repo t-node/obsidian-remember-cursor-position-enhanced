@@ -99,7 +99,11 @@ const CROSS_DEVICE_SYNC_WATCH_MS = 60000;
 // Force-push confirmation: poll peer acks every POLL ms, up to TIMEOUT (covers online devices on
 // the same network; offline ones are reported as pending rather than waited on indefinitely).
 const FORCE_VERIFY_POLL_MS = 1500;
-const FORCE_VERIFY_TIMEOUT_MS = 15000;
+const FORCE_VERIFY_TIMEOUT_MS = 20000;
+// After the live window, keep confirming quietly in the background up to this long, so an always-on
+// device whose ack round-trip is just slow still gets acknowledged (with a follow-up notice).
+const FORCE_VERIFY_EXTENDED_MS = 120000;
+const FORCE_VERIFY_BG_POLL_MS = 3000;
 const SYNC_RETRY_DELAYS_AGGRESSIVE = [1500, 4000, 8000, 15000, 30000, 60000];
 const SYNC_RETRY_DELAYS_NORMAL = [3000, 7000, 12000, 20000, 45000, 60000];
 const LEGACY_DB_FILENAME = '.obsidian/plugins/remember-cursor-position/cursor-positions.json';
@@ -186,6 +190,8 @@ export default class RememberCursorPosition extends Plugin {
 	lastAppliedForcedAt = 0;
 	/** Per-device label, stored in the local-only id file so it never syncs to other devices. */
 	localDeviceName: string | null = null;
+	/** Newest force-push beat being watched; lets a background confirm-watcher cancel if superseded. */
+	private activeForceBeat = 0;
 	scrollListenersAttached = false;
 	debouncedSave: Debouncer<[string, EphemeralState], void>;
 	pendingSavePath: string | null = null;
@@ -2122,14 +2128,13 @@ export default class RememberCursorPosition extends Plugin {
 			return;
 		}
 
-		const notice = new Notice('Pushing position… confirming on other devices', 0);
+		this.activeForceBeat = beat;
+		const notice = new Notice('Pushing position… confirming on your devices', 0);
 		const confirmed = new Set<string>(); // deviceIds that have acked
 		const peerLabels = new Map<string, string>(); // deviceId -> raw label (from its store)
 		const labelFor = (s: DeviceStateStore) => s.deviceName?.trim() || s.deviceId;
-		const deadline = Date.now() + FORCE_VERIFY_TIMEOUT_MS;
 
-		while (Date.now() < deadline && confirmed.size < peerIds.length) {
-			await new Promise((r) => window.setTimeout(r, FORCE_VERIFY_POLL_MS));
+		const scan = async () => {
 			this.remoteDeviceStoresCache.clear();
 			const stores = await this.loadRemoteDeviceStores();
 			for (const s of stores) {
@@ -2137,48 +2142,60 @@ export default class RememberCursorPosition extends Plugin {
 				peerLabels.set(s.deviceId, labelFor(s));
 				if (getForceAck(s, hash) >= beat) confirmed.add(s.deviceId);
 			}
-			notice.setMessage(
-				`Syncing position to your devices… ${confirmed.size}/${peerIds.length} confirmed`
-			);
+		};
+		// Disambiguate duplicate labels (e.g. two laptops both "Windows Desktop") with a short id.
+		const display = (id: string) => {
+			const labelOf = (x: string) => peerLabels.get(x) ?? x;
+			const dupes = peerIds.filter((x) => labelOf(x) === labelOf(id)).length;
+			return dupes > 1 ? `${labelOf(id)} (${id.slice(0, 4)})` : labelOf(id);
+		};
+
+		// Phase 1 — live window with a progress notice.
+		const deadline = Date.now() + FORCE_VERIFY_TIMEOUT_MS;
+		while (Date.now() < deadline && confirmed.size < peerIds.length) {
+			await new Promise((r) => window.setTimeout(r, FORCE_VERIFY_POLL_MS));
+			await scan();
+			notice.setMessage(`Syncing position to your devices… ${confirmed.size}/${peerIds.length} confirmed`);
 		}
-
 		notice.hide();
-		// Resolve each peer to a display name, disambiguating any duplicate labels (e.g. two laptops
-		// both still called "Windows Desktop") by appending a short id so the user can tell them apart.
-		const labelOf = (id: string) => peerLabels.get(id) ?? id;
-		const labelCounts = new Map<string, number>();
-		for (const id of peerIds) labelCounts.set(labelOf(id), (labelCounts.get(labelOf(id)) ?? 0) + 1);
-		const display = (id: string) =>
-			(labelCounts.get(labelOf(id)) ?? 0) > 1 ? `${labelOf(id)} (${id.slice(0, 4)})` : labelOf(id);
 
-		const confirmedIds = peerIds.filter((id) => confirmed.has(id));
-		const pendingIds = peerIds.filter((id) => !confirmed.has(id));
-		const confirmedLabels = confirmedIds.map(display);
-		const pendingLabels = pendingIds.map(display);
-
-		this.logger.info('FORCE', 'Force-push verification finished', {
-			notePath,
-			beat,
-			peerCount: peerIds.length,
-			confirmed: confirmedLabels,
-			pending: pendingLabels,
+		const pendingIds = () => peerIds.filter((id) => !confirmed.has(id));
+		this.logger.info('FORCE', 'Force-push live window finished', {
+			notePath, beat, peerCount: peerIds.length,
+			confirmed: peerIds.filter((id) => confirmed.has(id)).map(display),
+			pending: pendingIds().map(display),
 		});
 
-		if (pendingIds.length === 0) {
-			new Notice(
-				`Position confirmed on all ${peerIds.length} devices ✓\n${confirmedLabels.join(', ')}`,
-				8000
-			);
+		if (pendingIds().length === 0) {
+			new Notice(`Position confirmed on all ${peerIds.length} devices ✓\n${peerIds.map(display).join(', ')}`, 8000);
 			return;
 		}
-		const got = confirmedLabels.length ? confirmedLabels.join(', ') : 'none yet';
+
+		const confirmedNow = peerIds.filter((id) => confirmed.has(id)).map(display);
 		new Notice(
 			`Position pushed ✓\n` +
-			`Confirmed: ${got}\n` +
-			`Waiting on (asleep/closed): ${pendingLabels.join(', ')}\n` +
-			`— it will be exactly there the moment you open the note on it.`,
-			14000
+			`Confirmed: ${confirmedNow.length ? confirmedNow.join(', ') : 'none yet'}\n` +
+			`Still confirming: ${pendingIds().map(display).join(', ')}\n` +
+			`(a device only acks while its Obsidian is open — I'll keep checking)`,
+			12000
 		);
+
+		// Phase 2 — keep confirming quietly; a slow-but-awake device gets a follow-up acknowledgement.
+		const bgDeadline = Date.now() + FORCE_VERIFY_EXTENDED_MS;
+		while (Date.now() < bgDeadline && pendingIds().length > 0 && this.activeForceBeat === beat) {
+			await new Promise((r) => window.setTimeout(r, FORCE_VERIFY_BG_POLL_MS));
+			if (this.activeForceBeat !== beat) return; // a newer push superseded this watch
+			const before = confirmed.size;
+			await scan();
+			if (confirmed.size > before) {
+				if (pendingIds().length === 0) {
+					new Notice(`All devices now have your position ✓\n${peerIds.map(display).join(', ')}`, 8000);
+				} else {
+					const justNow = peerIds.filter((id) => confirmed.has(id)).map(display);
+					new Notice(`Confirmed: ${justNow.join(', ')} (${confirmed.size}/${peerIds.length}) ✓`, 6000);
+				}
+			}
+		}
 	}
 
 	/** Scan all peer stores for force-pushes and ack any not yet acknowledged. Run at startup and on
