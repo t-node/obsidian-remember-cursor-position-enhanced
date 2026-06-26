@@ -15,6 +15,7 @@ import {
 	setIcon,
 	ItemView,
 	WorkspaceLeaf,
+	SuggestModal,
 } from 'obsidian';
 import {
 	EphemeralState,
@@ -485,11 +486,14 @@ export default class RememberCursorPosition extends Plugin {
 			this.app.workspace.onLayoutReady(refreshFab);
 
 			// Revision tracking: a tiny one-tap badge to mark the current note "revised" (count syncs
-			// across all devices), plus a sidebar showing the recent-reading stack to jump back into.
+			// across all devices), plus the recent-reading stack to jump back into.
 			this.setupRevisionBadge();
 			this.registerView(RECENT_NOTES_VIEW, (leaf) => new RecentNotesView(leaf, this));
+			// ONE-TAP recents: a floating button that opens the recent list as a popup immediately —
+			// no sidebar, no digging through the ribbon. Tap it, see your recent nodes, tap one to jump.
+			this.setupRecentsFab();
 			this.addRibbonIcon('history', 'Recent notes you’ve been reading', () => {
-				void this.revealRecentNotesView();
+				void this.openRecentNotesModal();
 			});
 			const refreshRevisionUi = () => {
 				void this.refreshRevisionUi();
@@ -510,8 +514,8 @@ export default class RememberCursorPosition extends Plugin {
 			});
 			this.addCommand({
 				id: 'show-recent-notes',
-				name: 'Show recent notes (revision history)',
-				callback: () => void this.revealRecentNotesView(),
+				name: 'Show recent notes (quick jump)',
+				callback: () => void this.openRecentNotesModal(),
 			});
 
 			this.registerEvent(
@@ -1204,6 +1208,28 @@ export default class RememberCursorPosition extends Plugin {
 		this.ownDeviceStoreCache = stamped;
 	}
 
+	private storeMutationChain: Promise<unknown> = Promise.resolve();
+
+	/**
+	 * Serialize every read-modify-write of THIS device's store. Cursor saves, recent-visit records, and
+	 * revision marks all mutate different fields of the same file; without serialization they each load a
+	 * snapshot and the last writer clobbers the others (the lost-update race that wiped `recents` and
+	 * `revisions` on busy devices). Each callback runs after the previous one persisted, so it always
+	 * sees the freshest store. Return the next store to persist it, or null to make no change.
+	 */
+	async mutateOwnStore(
+		fn: (store: DeviceStateStore) => DeviceStateStore | null | Promise<DeviceStateStore | null>
+	): Promise<void> {
+		const run = this.storeMutationChain.then(async () => {
+			const store = await this.loadOwnDeviceStore();
+			const next = await fn(store);
+			if (next) await this.persistOwnDeviceStore(next);
+		});
+		// Keep the chain alive even if one mutation throws, so a single failure can't wedge all saves.
+		this.storeMutationChain = run.catch(() => {});
+		return run;
+	}
+
 	setCrossDeviceSyncWatch(notePath: string): void {
 		this.crossDeviceSyncWatchUntil.set(notePath, Date.now() + CROSS_DEVICE_SYNC_WATCH_MS);
 		this.logger.warn('SYNC', 'Watching for remote device state — Syncthing may still be delivering', {
@@ -1503,31 +1529,36 @@ export default class RememberCursorPosition extends Plugin {
 				return;
 			}
 
-			let store = await this.loadOwnDeviceStore();
 			const noteHash = getFileHash(notePath);
-			const existingOwn = store.notes[noteHash];
-			if (existingOwn && isEphemeralStatesEquals(existingOwn, stateToSave)) {
-				this.logger.debug('SAVE', 'Skip write — own device entry unchanged', {
-					notePath,
-					noteHash,
-					scroll: stateToSave.scroll,
-					cursorLine: stateToSave.cursor?.from.line,
-				});
-				if (notePath === this.lastLoadedFileName) {
-					this.lastEphemeralState = { ...existingOwn, filePath: notePath };
+			let savedRevision = 0;
+			let skippedUnchanged = false;
+			// Serialized so a concurrent recent-visit / revision-mark on the same store isn't clobbered.
+			await this.mutateOwnStore((store) => {
+				const existingOwn = store.notes[noteHash];
+				if (existingOwn && isEphemeralStatesEquals(existingOwn, stateToSave)) {
+					if (notePath === this.lastLoadedFileName) {
+						this.lastEphemeralState = { ...existingOwn, filePath: notePath };
+					}
+					skippedUnchanged = true;
+					return null; // no change to persist
 				}
+				const next = upsertNoteInStore(store, notePath, stateToSave);
+				savedRevision = next.storeRevision;
+				return next;
+			});
+			if (skippedUnchanged) {
+				this.logger.debug('SAVE', 'Skip write — own device entry unchanged', {
+					notePath, noteHash, scroll: stateToSave.scroll, cursorLine: stateToSave.cursor?.from.line,
+				});
 				return;
 			}
-
-			store = upsertNoteInStore(store, notePath, stateToSave);
-			await this.persistOwnDeviceStore(store);
 
 			this.logger.info('SAVE', 'Wrote state to device store', {
 				notePath,
 				stateFilePath,
 				deviceId: this.settings.deviceId,
 				platform: this.getDevicePlatformLabel(),
-				storeRevision: store.storeRevision,
+				storeRevision: savedRevision,
 				noteHash: getFileHash(notePath),
 				state: summarizeState(stateToSave),
 			});
@@ -1551,11 +1582,11 @@ export default class RememberCursorPosition extends Plugin {
 
 	async deleteNoteState(notePath: string): Promise<void> {
 		const hash = getFileHash(notePath);
-		const store = await this.loadOwnDeviceStore();
-		if (!store.notes[hash]) return;
-		const { [hash]: _removed, ...rest } = store.notes;
-		const updated = { ...store, notes: rest, storeRevision: store.storeRevision + 1 };
-		await this.persistOwnDeviceStore(updated);
+		await this.mutateOwnStore((store) => {
+			if (!store.notes[hash]) return null;
+			const { [hash]: _removed, ...rest } = store.notes;
+			return { ...store, notes: rest, storeRevision: store.storeRevision + 1 };
+		});
 		this.logger.info('SAVE', 'Removed note from device store', { notePath, hash });
 	}
 
@@ -2130,33 +2161,31 @@ export default class RememberCursorPosition extends Plugin {
 		this.logger.info('EVENT', 'Renaming state', { from: oldPath, to: file.path });
 		const oldHash = getFileHash(oldPath);
 		const newHash = getFileHash(file.path);
-		const store = await this.loadOwnDeviceStore();
-		const entry = store.notes[oldHash];
-		if (entry) {
+		const hadEntry = !!(await this.loadOwnDeviceStore()).notes[oldHash];
+		if (hadEntry) {
+			const entry = (await this.loadOwnDeviceStore()).notes[oldHash];
 			await this.writeNoteState(file.path, { ...entry, filePath: file.path });
 		}
 
-		// Carry the revise-count and recent-stack entry over to the new path so a rename never
-		// silently zeroes "I revised this 3×" or drops it out of recent history.
-		const fresh = await this.loadOwnDeviceStore();
-		const { [oldHash]: _removedNote, ...notes } = fresh.notes;
-
-		const revisions = { ...(fresh.revisions ?? {}) };
-		if (revisions[oldHash] != null) {
-			revisions[newHash] = (revisions[newHash] ?? 0) + revisions[oldHash];
-			delete revisions[oldHash];
-		}
-
-		const recents = (fresh.recents ?? []).map((r) =>
-			r.path === oldPath ? { path: file.path, hash: newHash, ts: r.ts } : r
-		);
-
-		await this.persistOwnDeviceStore({
-			...fresh,
-			notes: entry ? notes : fresh.notes,
-			revisions,
-			recents,
-			storeRevision: fresh.storeRevision + 1,
+		// Carry the note, revise-count, and recent-stack entry over to the new path (serialized so a
+		// concurrent save doesn't clobber it) so a rename never silently zeroes "I revised this 3×".
+		await this.mutateOwnStore((fresh) => {
+			const { [oldHash]: _removedNote, ...notes } = fresh.notes;
+			const revisions = { ...(fresh.revisions ?? {}) };
+			if (revisions[oldHash] != null) {
+				revisions[newHash] = (revisions[newHash] ?? 0) + revisions[oldHash];
+				delete revisions[oldHash];
+			}
+			const recents = (fresh.recents ?? []).map((r) =>
+				r.path === oldPath ? { path: file.path, hash: newHash, ts: r.ts } : r
+			);
+			return {
+				...fresh,
+				notes: hadEntry ? notes : fresh.notes,
+				revisions,
+				recents,
+				storeRevision: fresh.storeRevision + 1,
+			};
 		});
 
 		if (this.lastLoadedFileName === oldPath) {
@@ -2429,9 +2458,7 @@ export default class RememberCursorPosition extends Plugin {
 			new Notice('RCP-E: open a note first, then mark it revised.');
 			return;
 		}
-		let store = await this.loadOwnDeviceStore();
-		store = incrementOwnRevision(store, file.path, delta);
-		await this.persistOwnDeviceStore(store);
+		await this.mutateOwnStore((store) => incrementOwnRevision(store, file.path, delta));
 		const total = await this.getTotalRevisions(file.path);
 		this.logger.info('REVISION', delta >= 0 ? 'Marked note revised' : 'Undid a revision mark', {
 			notePath: file.path,
@@ -2448,9 +2475,7 @@ export default class RememberCursorPosition extends Plugin {
 	/** Push the just-opened note onto this device's recent-reading stack (synced + merged across devices). */
 	async recordRecentVisit(notePath: string): Promise<void> {
 		try {
-			let store = await this.loadOwnDeviceStore();
-			store = recordRecentVisit(store, notePath, Date.now(), RECENTS_LIMIT);
-			await this.persistOwnDeviceStore(store);
+			await this.mutateOwnStore((store) => recordRecentVisit(store, notePath, Date.now(), RECENTS_LIMIT));
 			this.refreshRecentNotesView();
 		} catch (e) {
 			this.logger.warn('REVISION', 'Failed to record recent visit', {
@@ -2464,6 +2489,45 @@ export default class RememberCursorPosition extends Plugin {
 	async getMergedRecents(): Promise<RecentVisit[]> {
 		const stores = await this.loadRemoteDeviceStores();
 		return mergeRecentVisits(stores, RECENTS_LIMIT);
+	}
+
+	private recentsFab: HTMLElement | null = null;
+
+	// A floating button pinned bottom-LEFT (mirror of the force button on the right) so it's always one
+	// tap away on every device. Tapping it opens the recent-notes list as a popup instantly — no sidebar
+	// to expand, no ribbon menu to dig through. That's the "one button, see my recent nodes" the user wants.
+	private setupRecentsFab(): void {
+		const style = document.createElement('style');
+		style.textContent =
+			'.rcp-recents-fab{position:fixed;left:16px;bottom:96px;width:54px;height:54px;border-radius:50%;' +
+			'background:var(--background-secondary);color:var(--text-normal);display:flex;align-items:center;' +
+			'justify-content:center;box-shadow:0 4px 14px rgba(0,0,0,.45);z-index:99999;cursor:pointer;' +
+			'-webkit-tap-highlight-color:transparent;border:2px solid var(--background-primary)}' +
+			'.rcp-recents-fab:active{transform:scale(.9)}.rcp-recents-fab svg{width:26px;height:26px}' +
+			// Recent-notes popup rows (SuggestModal)
+			'.rcp-recent-suggest{display:flex;align-items:center;gap:8px}' +
+			'.rcp-recent-suggest .rcp-recent-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}' +
+			'.rcp-recent-suggest .rcp-recent-folder{font-size:11px;opacity:.5}' +
+			'.rcp-recent-suggest .rcp-recent-count{flex:none;font-size:11px;font-weight:600;' +
+			'color:var(--interactive-accent);background:var(--background-secondary);border-radius:9px;padding:1px 7px}';
+		document.head.appendChild(style);
+
+		const btn = document.body.createDiv({ cls: 'rcp-recents-fab' });
+		setIcon(btn, 'history');
+		btn.setAttribute('aria-label', 'Recent notes — tap to jump back');
+		btn.addEventListener('click', () => void this.openRecentNotesModal());
+		this.recentsFab = btn;
+		this.register(() => {
+			btn.remove();
+			style.remove();
+		});
+	}
+
+	/** Open the recent-notes list as a one-tap popup (newest-first, type to filter, tap to jump). */
+	async openRecentNotesModal(): Promise<void> {
+		const recents = await this.getMergedRecents();
+		const stores = await this.loadRemoteDeviceStores();
+		new RecentNotesModal(this.app, this, recents, stores).open();
 	}
 
 	/** Open (or focus) the Recent Notes sidebar panel. */
@@ -2518,9 +2582,7 @@ export default class RememberCursorPosition extends Plugin {
 		// that hadn't synced yet) can ever outrank this force, no matter what wall-clock it carries.
 		const authority = (merged?.authority ?? 0) + 1;
 		const forced: EphemeralState = { ...live, filePath: notePath, lastModified: beat, forcedAt: beat, authority };
-		let store = await this.loadOwnDeviceStore();
-		store = upsertNoteInStore(store, notePath, forced);
-		await this.persistOwnDeviceStore(store);
+		await this.mutateOwnStore((store) => upsertNoteInStore(store, notePath, forced));
 		this.lastEphemeralState = { ...forced };
 		this.lastLocalInteractionAt = Date.now();
 		this.lastAppliedForcedAt = beat; // don't let our own push re-apply to ourselves
@@ -2633,22 +2695,21 @@ export default class RememberCursorPosition extends Plugin {
 			this.remoteDeviceStoresCache.clear();
 			const stores = await this.loadRemoteDeviceStores();
 			const ownId = this.settings.deviceId ?? 'unknown';
-			let own = await this.loadOwnDeviceStore();
 			let changed = false;
-			for (const s of stores) {
-				if (s.deviceId === ownId) continue;
-				for (const [hash, entry] of Object.entries(s.notes)) {
-					const forcedAt = entry.forcedAt;
-					if (typeof forcedAt === 'number' && forcedAt > getForceAck(own, hash)) {
-						own = recordForceAck(own, hash, forcedAt);
-						changed = true;
+			await this.mutateOwnStore((own) => {
+				for (const s of stores) {
+					if (s.deviceId === ownId) continue;
+					for (const [hash, entry] of Object.entries(s.notes)) {
+						const forcedAt = entry.forcedAt;
+						if (typeof forcedAt === 'number' && forcedAt > getForceAck(own, hash)) {
+							own = recordForceAck(own, hash, forcedAt);
+							changed = true;
+						}
 					}
 				}
-			}
-			if (changed) {
-				await this.persistOwnDeviceStore(own);
-				this.logger.info('FORCE', 'Reconciled force-push acks at load/resume');
-			}
+				return changed ? own : null;
+			});
+			if (changed) this.logger.info('FORCE', 'Reconciled force-push acks at load/resume');
 		} catch (e) {
 			this.logger.warn('FORCE', 'reconcileForceAcks failed', { error: String(e) });
 		}
@@ -2661,19 +2722,18 @@ export default class RememberCursorPosition extends Plugin {
 			if (!(await adapter.exists(stateFilePath))) return;
 			const remote = parseDeviceStoreJson(await adapter.read(stateFilePath));
 			if (!remote) return;
-			let own = await this.loadOwnDeviceStore();
 			let changed = false;
-			for (const [hash, entry] of Object.entries(remote.notes)) {
-				const forcedAt = entry.forcedAt;
-				if (typeof forcedAt === 'number' && forcedAt > getForceAck(own, hash)) {
-					own = recordForceAck(own, hash, forcedAt);
-					changed = true;
+			await this.mutateOwnStore((own) => {
+				for (const [hash, entry] of Object.entries(remote.notes)) {
+					const forcedAt = entry.forcedAt;
+					if (typeof forcedAt === 'number' && forcedAt > getForceAck(own, hash)) {
+						own = recordForceAck(own, hash, forcedAt);
+						changed = true;
+					}
 				}
-			}
-			if (changed) {
-				await this.persistOwnDeviceStore(own);
-				this.logger.debug('FORCE', 'Acked force-push(es) from peer store', { stateFilePath });
-			}
+				return changed ? own : null;
+			});
+			if (changed) this.logger.debug('FORCE', 'Acked force-push(es) from peer store', { stateFilePath });
 		} catch (e) {
 			this.logger.warn('FORCE', 'Failed to ack forces from peer store', { stateFilePath, error: String(e) });
 		}
@@ -3808,6 +3868,51 @@ class SettingTab extends PluginSettingTab {
 					});
 				});
 		});
+	}
+}
+
+// One-tap recent-notes popup: opens instantly with your recent reading stack (newest-first, merged
+// across all devices), type to filter, Enter/tap to jump. This is the single-click path the user wants
+// — no sidebar to expand, no ribbon to dig through. Triggered by the bottom-left floating button.
+class RecentNotesModal extends SuggestModal<RecentVisit> {
+	private plugin: RememberCursorPosition;
+	private recents: RecentVisit[];
+	private stores: DeviceStateStore[];
+
+	constructor(
+		app: App,
+		plugin: RememberCursorPosition,
+		recents: RecentVisit[],
+		stores: DeviceStateStore[]
+	) {
+		super(app);
+		this.plugin = plugin;
+		this.recents = recents;
+		this.stores = stores;
+		this.setPlaceholder('Recent notes — type to filter, Enter to jump');
+		this.emptyStateText = 'No recent notes yet — open a few and they’ll stack up here.';
+		this.limit = RECENTS_LIMIT;
+	}
+
+	getSuggestions(query: string): RecentVisit[] {
+		const q = query.trim().toLowerCase();
+		if (!q) return this.recents;
+		return this.recents.filter((r) => r.path.toLowerCase().includes(q));
+	}
+
+	renderSuggestion(visit: RecentVisit, el: HTMLElement): void {
+		el.addClass('rcp-recent-suggest');
+		const slash = visit.path.lastIndexOf('/');
+		const name = (slash >= 0 ? visit.path.slice(slash + 1) : visit.path).replace(/\.md$/i, '');
+		const folder = slash >= 0 ? visit.path.slice(0, slash) : '';
+		el.createSpan({ cls: 'rcp-recent-name', text: name });
+		if (folder) el.createSpan({ cls: 'rcp-recent-folder', text: folder });
+		const count = getTotalRevisionCount(this.stores, visit.path);
+		if (count > 0) el.createSpan({ cls: 'rcp-recent-count', text: `✓ ${count}` });
+	}
+
+	onChooseSuggestion(visit: RecentVisit): void {
+		void this.plugin.openNotePath(visit.path);
 	}
 }
 
