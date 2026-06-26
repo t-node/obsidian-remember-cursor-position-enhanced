@@ -14,9 +14,23 @@ export const DEVICE_STORE_VERSION = 2;
 /** Vault-root folder synced by LiveSync (fast path — not under .obsidian). */
 export const RECOMMENDED_STATE_DIR = 'cursor-state';
 
+/** How many recently-opened notes each device keeps. The merged cross-device history is also
+ *  capped to this. Big enough to cover "the last couple of days" of reading, small enough to stay tiny. */
+export const RECENTS_LIMIT = 100;
+
 export interface NoteStateEntry extends EphemeralState {
 	/** Monotonic save counter on this device (hybrid clock). */
 	revision?: number;
+}
+
+/** One entry in a device's recently-opened-notes stack (browser-history style). */
+export interface RecentVisit {
+	/** Vault path of the note. */
+	path: string;
+	/** Stable hash of the path (so renames/merges can match cheaply). */
+	hash: string;
+	/** Last time THIS device opened the note (epoch ms). Newest wins on merge. */
+	ts: number;
 }
 
 export interface DeviceStateStore {
@@ -30,6 +44,13 @@ export interface DeviceStateStore {
 	/** noteHash -> highest force-push stamp this device has received/processed. Lets the pusher
 	 *  confirm a force actually landed on each peer (not just that the file was written). */
 	acks?: Record<string, number>;
+	/** noteHash -> number of times THIS device marked the note "revised". This is a G-Counter CRDT:
+	 *  the user-facing total for a note is the SUM of this count across every device's store, so
+	 *  marking from any device just adds up — no conflicts, no lost increments. */
+	revisions?: Record<string, number>;
+	/** This device's recently-opened notes, newest-first, capped at RECENTS_LIMIT. Merged with every
+	 *  other device's list to produce one unified "recent reading" stack you can jump back into. */
+	recents?: RecentVisit[];
 }
 
 export function createEmptyDeviceStore(deviceId: string): DeviceStateStore {
@@ -72,6 +93,8 @@ export function parseDeviceStoreJson(raw: string): DeviceStateStore | null {
 			notes: parsed.notes ?? {},
 			deviceName: parsed.deviceName,
 			acks: parsed.acks ?? {},
+			revisions: parsed.revisions ?? {},
+			recents: Array.isArray(parsed.recents) ? parsed.recents : [],
 		};
 	} catch {
 		return null;
@@ -97,7 +120,18 @@ export function mergeDeviceStores(a: DeviceStateStore, b: DeviceStateStore): Dev
 		deviceId: a.deviceId,
 		storeRevision: Math.max(a.storeRevision ?? 0, b.storeRevision ?? 0),
 		notes: { ...a.notes },
+		// Revise-counter is monotonic per device, so the higher value is always the fresher one
+		// (conflict copies of the SAME device's file just lost a couple of recent increments).
+		revisions: mergeRevisionCounts(a.revisions, b.revisions),
+		// One device, two conflict copies → keep each note's most recent open.
+		recents: mergeRecentLists([a.recents, b.recents], RECENTS_LIMIT),
 	};
+	if (a.acks || b.acks) {
+		out.acks = { ...(a.acks ?? {}) };
+		for (const [hash, stamp] of Object.entries(b.acks ?? {})) {
+			out.acks[hash] = Math.max(out.acks[hash] ?? 0, stamp);
+		}
+	}
 
 	for (const [hash, entry] of Object.entries(b.notes)) {
 		const existing = out.notes[hash];
@@ -115,6 +149,87 @@ export function mergeDeviceStores(a: DeviceStateStore, b: DeviceStateStore): Dev
 		}
 	}
 	return out;
+}
+
+function mergeRevisionCounts(
+	a: Record<string, number> | undefined,
+	b: Record<string, number> | undefined
+): Record<string, number> {
+	const out: Record<string, number> = { ...(a ?? {}) };
+	for (const [hash, count] of Object.entries(b ?? {})) {
+		out[hash] = Math.max(out[hash] ?? 0, count);
+	}
+	return out;
+}
+
+/** Combine several recents lists into one newest-first, path-deduped stack (max ts per path), capped. */
+function mergeRecentLists(lists: Array<RecentVisit[] | undefined>, limit: number): RecentVisit[] {
+	const byPath = new Map<string, RecentVisit>();
+	for (const list of lists) {
+		for (const visit of list ?? []) {
+			if (!visit || !visit.path) continue;
+			const prev = byPath.get(visit.path);
+			if (!prev || (visit.ts ?? 0) > (prev.ts ?? 0)) {
+				byPath.set(visit.path, { path: visit.path, hash: visit.hash, ts: visit.ts ?? 0 });
+			}
+		}
+	}
+	return Array.from(byPath.values())
+		.sort((x, y) => (y.ts ?? 0) - (x.ts ?? 0))
+		.slice(0, limit);
+}
+
+/** Add `delta` to THIS device's revise-count for a note (floored at 0). Bumps storeRevision so peers notice. */
+export function incrementOwnRevision(
+	store: DeviceStateStore,
+	notePath: string,
+	delta = 1
+): DeviceStateStore {
+	const hash = getFileHash(notePath);
+	const current = store.revisions?.[hash] ?? 0;
+	const next = Math.max(0, current + delta);
+	return {
+		...store,
+		storeRevision: (store.storeRevision ?? 0) + 1,
+		revisions: { ...(store.revisions ?? {}), [hash]: next },
+	};
+}
+
+/** Times THIS device alone has marked a note revised. */
+export function getOwnRevisionCount(store: DeviceStateStore, notePath: string): number {
+	return store.revisions?.[getFileHash(notePath)] ?? 0;
+}
+
+/** User-facing total: revise-counts for a note summed across every device's store. */
+export function getTotalRevisionCount(stores: DeviceStateStore[], notePath: string): number {
+	const hash = getFileHash(notePath);
+	let total = 0;
+	for (const store of stores) {
+		total += store.revisions?.[hash] ?? 0;
+	}
+	return total;
+}
+
+/** Record that THIS device just opened a note: move it to the front of the recents stack, capped. */
+export function recordRecentVisit(
+	store: DeviceStateStore,
+	notePath: string,
+	ts: number,
+	limit = RECENTS_LIMIT
+): DeviceStateStore {
+	const hash = getFileHash(notePath);
+	const rest = (store.recents ?? []).filter((r) => r.path !== notePath);
+	const recents = [{ path: notePath, hash, ts }, ...rest].slice(0, limit);
+	return {
+		...store,
+		storeRevision: (store.storeRevision ?? 0) + 1,
+		recents,
+	};
+}
+
+/** The unified recent-reading stack across all devices: newest-first, one row per note. */
+export function mergeRecentVisits(stores: DeviceStateStore[], limit = RECENTS_LIMIT): RecentVisit[] {
+	return mergeRecentLists(stores.map((s) => s.recents), limit);
 }
 
 export function upsertNoteInStore(

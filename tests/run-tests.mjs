@@ -38,6 +38,8 @@ function stateFileBelongsToNote(stateDir, notePath, filePath) {
 }
 
 function compareAcrossDevices(a, b) {
+	const authDiff = (a.authority ?? 0) - (b.authority ?? 0);
+	if (authDiff !== 0) return authDiff;
 	return (a.lastModified ?? 0) - (b.lastModified ?? 0);
 }
 
@@ -116,6 +118,10 @@ function shouldApplyMergedState(disk, applied) {
 	const appliedScroll = applied.scroll ?? 0;
 	if (appliedScroll > 20 && isWeakTopOfNoteState(disk) && !isWeakTopOfNoteState(applied)) return false;
 	if (diskScroll > 20 && isWeakDefaultScrollSave(applied, disk)) return true;
+	const diskAuth = disk.authority ?? 0;
+	const appliedAuth = applied.authority ?? 0;
+	if (diskAuth > appliedAuth) return true;
+	if (appliedAuth > diskAuth) return false;
 	if ((applied.lastModified ?? 0) > (disk.lastModified ?? 0)) return false;
 	if ((disk.lastModified ?? 0) > (applied.lastModified ?? 0)) return true;
 	return false;
@@ -177,6 +183,7 @@ function isPerDeviceLogPath(path) {
 
 function isRegressiveScrollSave(proposed, existing) {
 	if (proposed.scroll == null || existing.scroll == null) return false;
+	if ((proposed.authority ?? 0) > (existing.authority ?? 0)) return false;
 	if ((proposed.lastModified ?? 0) > (existing.lastModified ?? 0)) return false;
 	return proposed.scroll < existing.scroll - 5 && existing.scroll > 20;
 }
@@ -203,6 +210,54 @@ function recordForceAck(store, noteHash, forcedAt) {
 		storeRevision: (store.storeRevision ?? 0) + 1,
 		acks: { ...(store.acks ?? {}), [noteHash]: forcedAt },
 	};
+}
+
+// --- Mirrors device-store.ts revision-counter + recents (G-Counter / merged history) ---
+const RECENTS_LIMIT = 100;
+
+function incrementOwnRevision(store, notePath, delta = 1) {
+	const hash = getFileHash(notePath);
+	const current = store.revisions?.[hash] ?? 0;
+	const next = Math.max(0, current + delta);
+	return {
+		...store,
+		storeRevision: (store.storeRevision ?? 0) + 1,
+		revisions: { ...(store.revisions ?? {}), [hash]: next },
+	};
+}
+
+function getTotalRevisionCount(stores, notePath) {
+	const hash = getFileHash(notePath);
+	let total = 0;
+	for (const store of stores) total += store.revisions?.[hash] ?? 0;
+	return total;
+}
+
+function recordRecentVisit(store, notePath, ts, limit = RECENTS_LIMIT) {
+	const hash = getFileHash(notePath);
+	const rest = (store.recents ?? []).filter((r) => r.path !== notePath);
+	const recents = [{ path: notePath, hash, ts }, ...rest].slice(0, limit);
+	return { ...store, storeRevision: (store.storeRevision ?? 0) + 1, recents };
+}
+
+function mergeRecentLists(lists, limit) {
+	const byPath = new Map();
+	for (const list of lists) {
+		for (const visit of list ?? []) {
+			if (!visit || !visit.path) continue;
+			const prev = byPath.get(visit.path);
+			if (!prev || (visit.ts ?? 0) > (prev.ts ?? 0)) {
+				byPath.set(visit.path, { path: visit.path, hash: visit.hash, ts: visit.ts ?? 0 });
+			}
+		}
+	}
+	return Array.from(byPath.values())
+		.sort((x, y) => (y.ts ?? 0) - (x.ts ?? 0))
+		.slice(0, limit);
+}
+
+function mergeRecentVisits(stores, limit = RECENTS_LIMIT) {
+	return mergeRecentLists(stores.map((s) => s.recents), limit);
 }
 
 let passed = 0;
@@ -567,6 +622,55 @@ test('getForceAck: 0 when the note was never force-pushed', () => {
 	assert.equal(getForceAck({ storeRevision: 0, notes: {} }, 'h1'), 0);
 });
 
+test('incrementOwnRevision: +1 bumps the note count and storeRevision', () => {
+	const s = incrementOwnRevision({ storeRevision: 2, notes: {} }, 'Notes/OS.md');
+	assert.equal(s.revisions[getFileHash('Notes/OS.md')], 1);
+	assert.equal(s.storeRevision, 3);
+});
+
+test('incrementOwnRevision: negative delta undoes but never goes below 0', () => {
+	let s = incrementOwnRevision({ storeRevision: 0, notes: {} }, 'a.md'); // 1
+	s = incrementOwnRevision(s, 'a.md', -1); // 0
+	s = incrementOwnRevision(s, 'a.md', -1); // stays 0
+	assert.equal(s.revisions[getFileHash('a.md')], 0);
+});
+
+test('getTotalRevisionCount: sums a note across every device (G-Counter)', () => {
+	const hash = getFileHash('AWS.md');
+	const stores = [
+		{ revisions: { [hash]: 2 } },
+		{ revisions: { [hash]: 1 } },
+		{ revisions: {} },
+	];
+	assert.equal(getTotalRevisionCount(stores, 'AWS.md'), 3);
+});
+
+test('recordRecentVisit: moves an existing note to the front (no duplicates)', () => {
+	let s = { storeRevision: 0, notes: {}, recents: [] };
+	s = recordRecentVisit(s, 'a.md', 100);
+	s = recordRecentVisit(s, 'b.md', 200);
+	s = recordRecentVisit(s, 'a.md', 300); // revisit a — should jump to front, not duplicate
+	assert.deepEqual(s.recents.map((r) => r.path), ['a.md', 'b.md']);
+	assert.equal(s.recents[0].ts, 300);
+});
+
+test('recordRecentVisit: caps the stack at the limit', () => {
+	let s = { storeRevision: 0, notes: {}, recents: [] };
+	for (let i = 0; i < 5; i++) s = recordRecentVisit(s, `n${i}.md`, i, 3);
+	assert.equal(s.recents.length, 3);
+	assert.deepEqual(s.recents.map((r) => r.path), ['n4.md', 'n3.md', 'n2.md']);
+});
+
+test('mergeRecentVisits: unifies devices newest-first, one row per note', () => {
+	const stores = [
+		{ recents: [{ path: 'a.md', hash: 'x', ts: 100 }, { path: 'b.md', hash: 'y', ts: 50 }] },
+		{ recents: [{ path: 'a.md', hash: 'x', ts: 300 }, { path: 'c.md', hash: 'z', ts: 200 }] },
+	];
+	const merged = mergeRecentVisits(stores);
+	assert.deepEqual(merged.map((r) => r.path), ['a.md', 'c.md', 'b.md']);
+	assert.equal(merged[0].ts, 300); // newest open of 'a' across devices wins
+});
+
 test('explainApplyRejection describes local timestamp win', () => {
 	const reason = explainApplyRejection(
 		{ scroll: 500, lastModified: 1000 },
@@ -620,6 +724,71 @@ test('isForbiddenSharedLogPath blocks shared vault-root logs', () => {
 	assert.equal(isForbiddenSharedLogPath('.obsidian/plugins/foo/debug.log'), true);
 	assert.equal(isPerDeviceLogPath('rcp-enhanced-logs/Windows-Desktop-abc12345.log'), true);
 	assert.equal(isPerDeviceLogPath('rcp-enhanced-debug.log'), false);
+});
+
+// --- Authority tier: skew-proof force stickiness (the "force reverted to an old state" fix) ---
+
+// Mirror of writeNoteState's authority inheritance + forcePushCurrentNote's tier bump.
+function inheritAuthority(mergedExisting, incomingState) {
+	return Math.max(mergedExisting?.authority ?? 0, incomingState.authority ?? 0) || undefined;
+}
+function forcedState(scroll, lastModified, mergedSeen) {
+	const authority = (mergedSeen?.authority ?? 0) + 1;
+	return { scroll, lastModified, forcedAt: lastModified, authority, cursor: { from: { line: 1, ch: 0 }, to: { line: 1, ch: 0 } } };
+}
+
+test('authority: a forced tier-1 state beats a non-forced tier-0 state with a FAR HIGHER wall-clock', () => {
+	// This is the exact reported bug: a stale/skewed device carries a higher lastModified.
+	const force = { sourceDeviceId: 'phone', scroll: 400, lastModified: 1000, authority: 1, cursor: { from: { line: 50, ch: 0 }, to: { line: 50, ch: 0 } } };
+	const skewed = { sourceDeviceId: 'orphan', scroll: 20, lastModified: 9_999_999, authority: 0, cursor: { from: { line: 2, ch: 0 }, to: { line: 2, ch: 0 } } };
+	const merged = mergeStatesFromAll([skewed, force]);
+	assert.equal(merged.scroll, 400); // the force wins despite the skewed clock
+});
+
+test('authority: tier 0 everywhere is byte-identical to the legacy lastModified merge', () => {
+	const a = { sourceDeviceId: 'a', scroll: 100, lastModified: 5000, cursor: { from: { line: 9, ch: 0 }, to: { line: 9, ch: 0 } } };
+	const b = { sourceDeviceId: 'b', scroll: 200, lastModified: 8000, cursor: { from: { line: 9, ch: 0 }, to: { line: 9, ch: 0 } } };
+	assert.equal(mergeStatesFromAll([a, b]).scroll, 200); // newest lastModified, exactly as before
+});
+
+test('authority: within the same tier, the newer wall-clock still wins (normal forward reading)', () => {
+	const older = { sourceDeviceId: 'a', scroll: 300, lastModified: 5000, authority: 1, cursor: { from: { line: 9, ch: 0 }, to: { line: 9, ch: 0 } } };
+	const newer = { sourceDeviceId: 'b', scroll: 600, lastModified: 7000, authority: 1, cursor: { from: { line: 9, ch: 0 }, to: { line: 9, ch: 0 } } };
+	assert.equal(mergeStatesFromAll([older, newer]).scroll, 600);
+});
+
+test('authority: a NEWER force (tier 2) overrides an older force (tier 1)', () => {
+	const f1 = { sourceDeviceId: 'a', scroll: 300, lastModified: 9000, authority: 1, cursor: { from: { line: 9, ch: 0 }, to: { line: 9, ch: 0 } } };
+	const f2 = { sourceDeviceId: 'b', scroll: 700, lastModified: 1000, authority: 2, cursor: { from: { line: 9, ch: 0 }, to: { line: 9, ch: 0 } } };
+	assert.equal(mergeStatesFromAll([f1, f2]).scroll, 700); // tier 2 wins even with older clock
+});
+
+test('authority: every save inherits the forced tier, so the force stays sticky', () => {
+	const force = forcedState(400, 1000, { authority: 0 }); // authority 1
+	assert.equal(force.authority, 1);
+	// A later save on another device, having seen the force, inherits tier 1.
+	const inherited = inheritAuthority(force, { scroll: 450, lastModified: 2000 });
+	assert.equal(inherited, 1);
+	// A device that never saw the force writes tier 0 (undefined) — and loses to the force.
+	assert.equal(inheritAuthority({ authority: 0 }, { scroll: 30, lastModified: 5000 }), undefined);
+});
+
+test('authority: shouldApplyMergedState applies a higher tier even with an older wall-clock', () => {
+	const disk = { scroll: 400, lastModified: 1000, authority: 1, cursor: { from: { line: 50, ch: 0 }, to: { line: 50, ch: 0 } } };
+	const applied = { scroll: 20, lastModified: 9_000_000, authority: 0, cursor: { from: { line: 2, ch: 0 }, to: { line: 2, ch: 0 } } };
+	assert.equal(shouldApplyMergedState(disk, applied), true);
+});
+
+test('authority: a higher-tier WEAK top-of-note still does NOT clobber real reading (guard intact)', () => {
+	const weakForce = { scroll: 0, lastModified: 1000, authority: 5, cursor: { from: { line: 0, ch: 0 }, to: { line: 0, ch: 0 } } };
+	const realReading = { scroll: 500, lastModified: 10, authority: 0, cursor: { from: { line: 88, ch: 0 }, to: { line: 88, ch: 0 } } };
+	assert.equal(shouldApplyMergedState(weakForce, realReading), false);
+});
+
+test('authority: a higher-tier save is never treated as a regressive scroll', () => {
+	const proposed = { scroll: 10, lastModified: 100, authority: 1 };
+	const existing = { scroll: 500, lastModified: 9000, authority: 0 };
+	assert.equal(isRegressiveScrollSave(proposed, existing), false);
 });
 
 console.log('\nMock vault simulation\n');

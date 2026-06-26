@@ -8,6 +8,13 @@ export interface EphemeralState {
 	lastModified?: number;
 	/** Monotonic revision on the source device (hybrid clock). */
 	revision?: number;
+	/** Skew-proof cross-device priority TIER (default 0). Compared BEFORE `lastModified`, so a higher
+	 *  tier always wins regardless of any device's wall-clock. A force-push bumps the tier above every
+	 *  state it can see; every later save inherits the current tier. This is what makes a force STICK:
+	 *  a stale / clock-skewed / orphaned state sitting at a lower tier can never revert it, while normal
+	 *  forward reading (same tier, newer `lastModified`) still wins exactly as before. Tier 0 everywhere
+	 *  == legacy behavior, so notes you never force behave identically to today. */
+	authority?: number;
 	/** Nearest heading line above cursor (cross-device anchor). */
 	anchorLine?: number;
 	/** Set ONLY by a deliberate force-push. Tells receivers to apply this state immediately,
@@ -20,8 +27,11 @@ export interface TaggedNoteState extends EphemeralState {
 	sourceDeviceId?: string;
 }
 
-/** Wall-clock skew threshold (ms) before logging a suspected fast/slow device clock. */
-export const CLOCK_SKEW_LOG_THRESHOLD_MS = 120_000;
+/** Wall-clock skew threshold (ms) before logging a suspected fast/slow device clock. Lowered to 5s
+ *  because a force-push only beats the visible state by +2s — any device whose clock is more than a
+ *  few seconds ahead can outrank a force, which is exactly the "it reverted to an old state" symptom.
+ *  We want that skew surfaced in the logs, not hidden under a 2-minute threshold. */
+export const CLOCK_SKEW_LOG_THRESHOLD_MS = 5_000;
 
 /**
  * Scroll values within this many units are treated as the SAME position. Cross-device
@@ -161,10 +171,14 @@ export function compareSameDeviceRevision(a: EphemeralState, b: EphemeralState):
 }
 
 /**
- * Compare states from different devices: wall-clock lastModified wins.
- * Returns positive if `a` is newer than `b`.
+ * Compare states from different devices. The skew-proof `authority` TIER is decisive; only within the
+ * same tier do we fall back to wall-clock `lastModified` (the legacy comparison). Returns positive if
+ * `a` ranks newer than `b`. Because every normal state is tier 0, this is identical to the old
+ * lastModified comparison for any note that has never been force-pushed.
  */
 export function compareAcrossDevices(a: TaggedNoteState, b: TaggedNoteState): number {
+	const authDiff = (a.authority ?? 0) - (b.authority ?? 0);
+	if (authDiff !== 0) return authDiff;
 	return (a.lastModified ?? 0) - (b.lastModified ?? 0);
 }
 
@@ -204,6 +218,8 @@ function pickNewerTagged(a: TaggedNoteState, b: TaggedNoteState): TaggedNoteStat
 /** True when a save would move scroll back toward the top while disk already has a deeper position. */
 export function isRegressiveScrollSave(proposed: EphemeralState, existing: EphemeralState): boolean {
 	if (proposed.scroll == null || existing.scroll == null) return false;
+	// A higher-tier (e.g. force-bumped) position is a deliberate authority change, never "regressive".
+	if ((proposed.authority ?? 0) > (existing.authority ?? 0)) return false;
 	if ((proposed.lastModified ?? 0) > (existing.lastModified ?? 0)) return false;
 	if (
 		proposed.revision != null &&
@@ -368,6 +384,15 @@ export function shouldApplyMergedState(
 		return true;
 	}
 
+	// Skew-proof tier first: a higher-authority merged state (e.g. a force-push, or a position saved
+	// in the forced tier) applies even if its wall-clock looks older — that's the whole point of the
+	// tier. The weak-top guard above still runs FIRST, so a weak/top-of-note state never clobbers real
+	// reading even at a higher tier. Within the same tier we keep the exact legacy lastModified rule.
+	const diskAuth = disk.authority ?? 0;
+	const appliedAuth = applied.authority ?? 0;
+	if (diskAuth > appliedAuth) return true;
+	if (appliedAuth > diskAuth) return false;
+
 	// Recency is decided by wall-clock (lastModified) only, matching the cross-device merge
 	// comparator (compareAcrossDevices). `revision` is a PER-DEVICE counter and must NOT gate
 	// applies: comparing it across devices let whichever device had the higher counter win
@@ -388,6 +413,12 @@ export interface MergeCandidateSummary {
 	anchorLine?: number;
 	lastModified?: number;
 	revision?: number;
+	/** Skew-proof priority tier (see EphemeralState.authority). Shown so the diag makes clear WHY a
+	 *  candidate won — a higher tier beats wall-clock. */
+	authority?: number;
+	/** Set when this candidate carries a force-push stamp — lets the diag show whether the winner
+	 *  was a deliberate force or whether a force LOST to a higher (possibly skewed) wall-clock. */
+	forcedAt?: number;
 }
 
 export interface MergeAnalysis {
@@ -405,7 +436,40 @@ function summarizeCandidate(st: TaggedNoteState): MergeCandidateSummary {
 		anchorLine: st.anchorLine,
 		lastModified: st.lastModified,
 		revision: st.revision,
+		authority: st.authority,
+		forcedAt: st.forcedAt,
 	};
+}
+
+/**
+ * Spot the "my force-push got reverted to an old state" case directly in the merge result: a candidate
+ * carried a force-push stamp but did NOT win, because another device's plain (un-forced) state had a
+ * higher wall-clock `lastModified`. That higher timestamp is almost always clock skew on the winning
+ * device (often an orphaned/stale store), and it's the precise event we want flagged in the logs.
+ */
+export function detectForceOutranked(
+	sources: TaggedNoteState[],
+	winnerDeviceId: string | null
+): { forcedDeviceId: string; winnerDeviceId: string | null; skewMs: number; forcedAt: number } | null {
+	const forced = sources.filter((s) => typeof s.forcedAt === 'number');
+	if (forced.length === 0) return null;
+	const winner = sources.find((s) => s.sourceDeviceId === winnerDeviceId) ?? null;
+	const winnerAuth = winner?.authority ?? 0;
+	for (const f of forced) {
+		if (f.sourceDeviceId === winnerDeviceId) continue; // the force won — fine
+		// With the authority tier in place, a force should only ever lose to a STRICTLY HIGHER tier
+		// (i.e. a newer, legitimate force). If it lost to an equal/lower tier, that's the real bug —
+		// wall-clock/skew beat a force despite the tiering — and exactly what we want flagged.
+		if (winnerAuth > (f.authority ?? 0)) continue;
+		const skewMs = (winner?.lastModified ?? 0) - (f.lastModified ?? 0);
+		return {
+			forcedDeviceId: f.sourceDeviceId ?? '?',
+			winnerDeviceId,
+			skewMs,
+			forcedAt: f.forcedAt as number,
+		};
+	}
+	return null;
 }
 
 /** Merge with full audit trail for debug logging. */
@@ -468,6 +532,11 @@ export function explainApplyRejection(
 	if (diskScroll > 20 && isWeakDefaultScrollSave(applied, disk)) {
 		return 'would apply (weak local top-of-note vs remote scroll)';
 	}
+
+	const diskAuth = disk.authority ?? 0;
+	const appliedAuth = applied.authority ?? 0;
+	if (diskAuth > appliedAuth) return `would apply (higher authority tier: ${diskAuth} > ${appliedAuth})`;
+	if (appliedAuth > diskAuth) return `held — local is a higher authority tier (${appliedAuth} > ${diskAuth})`;
 
 	const diskTime = disk.lastModified ?? 0;
 	const appliedTime = applied.lastModified ?? 0;

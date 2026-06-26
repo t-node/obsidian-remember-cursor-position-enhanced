@@ -13,6 +13,8 @@ import {
 	Notice,
 	requestUrl,
 	setIcon,
+	ItemView,
+	WorkspaceLeaf,
 } from 'obsidian';
 import {
 	EphemeralState,
@@ -28,6 +30,7 @@ import {
 	isWeakTopOfNoteState,
 	isCaretAtOrigin,
 	analyzeMergeForNote,
+	detectForceOutranked,
 	explainApplyRejection,
 	shouldApplyMergedState,
 	shouldWatchForRemoteState,
@@ -51,7 +54,13 @@ import {
 	recordForceAck,
 	getForceAck,
 	isSyncConflictFileName,
+	incrementOwnRevision,
+	getTotalRevisionCount,
+	recordRecentVisit,
+	mergeRecentVisits,
+	RECENTS_LIMIT,
 	type DeviceStateStore,
+	type RecentVisit,
 	type StateFileAdapter,
 } from './device-store';
 import { PluginLogger, summarizeState, LOG_DIR as LOGGER_LOG_DIR, isForbiddenSharedLogPath } from './logger';
@@ -107,6 +116,11 @@ const FORCE_VERIFY_BG_POLL_MS = 3000;
 const SYNC_RETRY_DELAYS_AGGRESSIVE = [1500, 4000, 8000, 15000, 30000, 60000];
 const SYNC_RETRY_DELAYS_NORMAL = [3000, 7000, 12000, 20000, 45000, 60000];
 const LEGACY_DB_FILENAME = '.obsidian/plugins/remember-cursor-position/cursor-positions.json';
+const RECENT_NOTES_VIEW = 'rcp-recent-notes';
+// Vault-root folder used to auto-deliver new plugin builds across devices via Syncthing. Only the
+// master writes it (deploy-all.ps1 drops main.js + manifest.json here); every device's plugin copies
+// it into place when it differs, then asks for a reload. NOT in .stignore, so it syncs like notes do.
+const PLUGIN_DIST_DIR = 'plugin-dist';
 
 const DEFAULT_SETTINGS: PluginSettings = {
 	stateDir: '',
@@ -470,6 +484,36 @@ export default class RememberCursorPosition extends Plugin {
 			this.registerEvent(this.app.workspace.on('layout-change', refreshFab));
 			this.app.workspace.onLayoutReady(refreshFab);
 
+			// Revision tracking: a tiny one-tap badge to mark the current note "revised" (count syncs
+			// across all devices), plus a sidebar showing the recent-reading stack to jump back into.
+			this.setupRevisionBadge();
+			this.registerView(RECENT_NOTES_VIEW, (leaf) => new RecentNotesView(leaf, this));
+			this.addRibbonIcon('history', 'Recent notes you’ve been reading', () => {
+				void this.revealRecentNotesView();
+			});
+			const refreshRevisionUi = () => {
+				void this.refreshRevisionUi();
+			};
+			this.registerEvent(this.app.workspace.on('active-leaf-change', refreshRevisionUi));
+			this.registerEvent(this.app.workspace.on('file-open', refreshRevisionUi));
+			this.app.workspace.onLayoutReady(refreshRevisionUi);
+
+			this.addCommand({
+				id: 'mark-note-revised',
+				name: 'Mark current note as revised (+1)',
+				callback: () => void this.markCurrentNoteRevised(1),
+			});
+			this.addCommand({
+				id: 'unmark-note-revised',
+				name: 'Undo a revision mark on current note (−1)',
+				callback: () => void this.markCurrentNoteRevised(-1),
+			});
+			this.addCommand({
+				id: 'show-recent-notes',
+				name: 'Show recent notes (revision history)',
+				callback: () => void this.revealRecentNotesView(),
+			});
+
 			this.registerEvent(
 				this.app.workspace.on('file-open', (file) => {
 					if (file) {
@@ -522,6 +566,10 @@ export default class RememberCursorPosition extends Plugin {
 					if (file.path === pluginManifest || file.path === pluginMain) {
 						void this.checkForSyncedPluginUpdate();
 					}
+					// A new build synced into plugin-dist/ — copy it into place and prompt for a reload.
+					if (file.path === `${PLUGIN_DIST_DIR}/main.js` || file.path === `${PLUGIN_DIST_DIR}/manifest.json`) {
+						void this.checkForDeliveredPluginUpdate();
+					}
 				})
 			);
 
@@ -556,6 +604,12 @@ export default class RememberCursorPosition extends Plugin {
 			);
 
 			this.setupDOMEventListeners();
+			// Confirm to the master what build we're RUNNING (syncs back), THEN pick up any newer build
+			// that synced in while this device was closed (so reopening is enough to update).
+			this.app.workspace.onLayoutReady(async () => {
+				await this.writeRunningBuildAck();
+				await this.checkForDeliveredPluginUpdate();
+			});
 			void this.seedRemoteStoreRevisionSnapshot();
 			this.applyPeriodicFlush();
 			this.startHealthHeartbeat();
@@ -658,6 +712,96 @@ export default class RememberCursorPosition extends Plugin {
 
 	async listDeviceDebugLogs(): Promise<void> {
 		await this.showDebugLogPaths();
+	}
+
+	/**
+	 * Deploy verification: record the build THIS device is actually running into the synced
+	 * `plugin-dist/running-{deviceId}.json`. It syncs back to the master, so `deploy-all` can confirm a
+	 * build landed AND is live on every device — including the phone/tablet/office laptop you never plug
+	 * in. `bytes` is the UTF-8 byte length of the running main.js, which equals the file's on-disk size
+	 * on the master, so the master can compare it to the build it shipped. Per-device filename => no
+	 * sync conflicts. Skips the write when unchanged (no churn). Call it reflecting the RUNNING build
+	 * (i.e. BEFORE checkForDeliveredPluginUpdate stages a newer one for the next reload).
+	 */
+	async writeRunningBuildAck(): Promise<void> {
+		try {
+			const deviceId = this.settings.deviceId ?? 'unknown';
+			const installedMain = `${this.manifest.dir}/main.js`;
+			if (!(await this.app.vault.adapter.exists(installedMain))) return;
+			const code = await this.app.vault.adapter.read(installedMain);
+			const bytes = new TextEncoder().encode(code).length;
+			const ackPath = `${PLUGIN_DIST_DIR}/running-${deviceId}.json`;
+
+			if (await this.app.vault.adapter.exists(ackPath)) {
+				try {
+					const prev = JSON.parse(await this.app.vault.adapter.read(ackPath)) as { bytes?: number; version?: string };
+					if (prev.bytes === bytes && prev.version === this.manifest.version) return; // unchanged
+				} catch { /* fall through and rewrite */ }
+			}
+			if (!(await this.app.vault.adapter.exists(PLUGIN_DIST_DIR))) {
+				await this.app.vault.adapter.mkdir(PLUGIN_DIST_DIR);
+			}
+			const ack = {
+				deviceId,
+				deviceName: this.getDeviceLabel(),
+				platform: this.getDevicePlatformLabel(),
+				version: this.manifest.version,
+				bytes,
+				ts: Date.now(),
+			};
+			await this.app.vault.adapter.write(ackPath, JSON.stringify(ack, null, 2));
+			this.logger.info('LOAD', 'Wrote running-build ack', ack);
+		} catch (e) {
+			this.logger.warn('LOAD', 'Failed to write running-build ack', {
+				err: e instanceof Error ? e.message : String(e),
+			});
+		}
+	}
+
+	/**
+	 * Auto-delivery: a new build dropped into the synced `plugin-dist/` folder (by deploy-all.ps1 on the
+	 * master) reaches every device through Syncthing. Here we copy it into THIS device's plugin folder
+	 * when it differs from what's installed, then ask for a reload. Content-based (not version-gated), so
+	 * it works even when the version isn't bumped during iteration. Single-writer (only the master writes
+	 * plugin-dist/), so there are no sync conflicts; each device only ever READS it.
+	 */
+	async checkForDeliveredPluginUpdate(): Promise<void> {
+		try {
+			const distMain = `${PLUGIN_DIST_DIR}/main.js`;
+			if (!(await this.app.vault.adapter.exists(distMain))) return;
+
+			const distCode = await this.app.vault.adapter.read(distMain);
+			if (!distCode || distCode.length < 1000) return; // guard against a half-synced/empty file
+
+			const installedMain = `${this.manifest.dir}/main.js`;
+			const installedCode = (await this.app.vault.adapter.exists(installedMain))
+				? await this.app.vault.adapter.read(installedMain)
+				: '';
+			if (distCode === installedCode) return; // already up to date
+
+			let distVersion = '?';
+			const distManifest = `${PLUGIN_DIST_DIR}/manifest.json`;
+			if (await this.app.vault.adapter.exists(distManifest)) {
+				const rawManifest = await this.app.vault.adapter.read(distManifest);
+				try { distVersion = (JSON.parse(rawManifest) as { version?: string }).version ?? '?'; } catch { /* keep ? */ }
+				await this.app.vault.adapter.write(`${this.manifest.dir}/manifest.json`, rawManifest);
+			}
+			await this.app.vault.adapter.write(installedMain, distCode);
+
+			const reloadHint = Platform.isDesktopApp
+				? 'Press Ctrl+R to reload Obsidian.'
+				: 'Close and reopen Obsidian to activate.';
+			this.logger.info('LOAD', 'Delivered plugin build copied from plugin-dist/ — reload required', {
+				deliveredVersion: distVersion,
+				runningVersion: this.manifest.version,
+				bytes: distCode.length,
+			});
+			new Notice(`RCP-E build delivered via sync (v${distVersion}).\n${reloadHint}`, 15000);
+		} catch (e) {
+			this.logger.warn('LOAD', 'Failed to apply delivered plugin update', {
+				err: e instanceof Error ? e.message : String(e),
+			});
+		}
 	}
 
 	async checkForSyncedPluginUpdate(): Promise<void> {
@@ -1135,6 +1279,24 @@ export default class RememberCursorPosition extends Plugin {
 			candidates: analysis.candidates,
 		};
 
+		// The exact "I force-pushed but it reverted to an old state" signal: a force lost the merge to
+		// another device's higher (usually skewed/stale) wall-clock. Captured into the synced .diag so
+		// it comes home from any device for diagnosis — and names the device + skew that beat the force.
+		const outranked = detectForceOutranked(tagged, analysis.winnerDeviceId);
+		if (outranked) {
+			this.logger.warn('SYNC', 'Force-push OUTRANKED by another device (possible clock skew / stale store)', {
+				notePath,
+				...outranked,
+				candidates: analysis.candidates,
+			});
+			void this.writeSyncDiagnostic('force-outranked', {
+				notePath,
+				noteHash: getFileHash(notePath),
+				...outranked,
+				candidates: analysis.candidates,
+			});
+		}
+
 		const merged = analysis.merged;
 		if (!merged) {
 			return null;
@@ -1225,10 +1387,15 @@ export default class RememberCursorPosition extends Plugin {
 
 			const existing = await this.readMergedNoteState(notePath);
 			const saveTimestamp = state.lastModified ?? Date.now();
+			// Inherit the note's current authority tier so a force stays sticky: every subsequent save
+			// (on any device) carries the forced tier forward, and a stale lower-tier state can never
+			// win it back. For a note that was never forced this is 0 → identical to legacy behavior.
+			const inheritedAuthority = Math.max(existing?.authority ?? 0, state.authority ?? 0);
 			const stateToSave: EphemeralState = {
 				...state,
 				filePath: notePath,
 				lastModified: saveTimestamp,
+				authority: inheritedAuthority || undefined,
 			};
 
 			// A save that reflects the user's CURRENT, deliberate position must win over the
@@ -1457,6 +1624,11 @@ export default class RememberCursorPosition extends Plugin {
 		this.loadingFile = true;
 		this.lastLoadedFileName = file.path;
 
+		// Drop this note onto the recent-reading stack and refresh the revise badge (fire-and-forget so
+		// it never delays the restore below).
+		void this.recordRecentVisit(file.path);
+		void this.refreshRevisionUi();
+
 		let restored = false;
 
 		const finishRestore = (source: 'layout-change' | 'fallback-timer') => {
@@ -1584,17 +1756,35 @@ export default class RememberCursorPosition extends Plugin {
 		this.debouncedSave(notePath, state);
 	}
 
+	getSyncDiagnosticPath(deviceId = this.settings.deviceId ?? 'unknown'): string {
+		// NOTE: name is `{deviceId}.diag.json`, NOT `.diag-{deviceId}.json`. The old dotted name was
+		// excluded from sync by the `.stignore` rule `/cursor-state/.diag-*`, so a remote device's diag
+		// never came home — useless for a fleet post-mortem. This name rides the same sync path as the
+		// store files (which sync fine), so EVERY device's diag now lands in every vault automatically,
+		// and it still isn't misread as a state/store/legacy file (it has a dot, no hyphen).
+		return `${this.settings.stateDir}/${deviceId}.diag.json`;
+	}
+
 	async writeSyncDiagnostic(event: string, data: Record<string, unknown>): Promise<void> {
 		const deviceId = this.settings.deviceId ?? 'unknown';
-		const path = `${this.settings.stateDir}/.diag-${deviceId}.json`;
+		const path = this.getSyncDiagnosticPath(deviceId);
+		const legacyPath = `${this.settings.stateDir}/.diag-${deviceId}.json`;
 		try {
-			let events: unknown[] = [];
+			let events: Array<Record<string, unknown>> = [];
 			if (await this.app.vault.adapter.exists(path)) {
 				const raw = await this.app.vault.adapter.read(path);
-				const parsed = JSON.parse(raw) as { events?: unknown[] };
+				const parsed = JSON.parse(raw) as { events?: Array<Record<string, unknown>> };
 				events = parsed.events ?? [];
+			} else if (await this.app.vault.adapter.exists(legacyPath)) {
+				// One-time migration: carry the old (un-synced) dotted diag forward, then remove it.
+				try {
+					const raw = await this.app.vault.adapter.read(legacyPath);
+					const parsed = JSON.parse(raw) as { events?: Array<Record<string, unknown>> };
+					events = parsed.events ?? [];
+					await this.app.vault.adapter.remove(legacyPath);
+				} catch { /* ignore a malformed legacy diag */ }
 			}
-			events.push({
+			const newEvent: Record<string, unknown> = {
 				ts: new Date().toISOString(),
 				event,
 				platform: this.getDevicePlatformLabel(),
@@ -1602,9 +1792,28 @@ export default class RememberCursorPosition extends Plugin {
 				deviceName: this.getDeviceLabel(),
 				pluginVersion: this.manifest.version,
 				...data,
-			});
-			if (events.length > 120) {
-				events = events.slice(events.length - 120);
+			};
+			// Collapse a run of identical events (e.g. the same cross-device position re-applied every
+			// few seconds by the poll) into ONE entry with a count + latest timestamp. This keeps the
+			// rare high-signal events (force-pushed, force-outranked, apply-rejected, real position
+			// changes) from being evicted by repetitive noise, so a day-old event still survives.
+			const sig = (e: Record<string, unknown> | undefined): string => {
+				if (!e) return '';
+				const st = (e.state ?? e.incoming ?? e.forced) as { scroll?: number } | undefined;
+				const scroll = st?.scroll != null ? Math.round(st.scroll) : '-';
+				return `${e.event}|${e.notePath ?? ''}|${e.winnerDeviceId ?? ''}|${e.reason ?? ''}|${scroll}`;
+			};
+			const last = events[events.length - 1];
+			if (last && sig(last) === sig(newEvent)) {
+				newEvent.repeatCount = ((last.repeatCount as number) ?? 1) + 1;
+				newEvent.firstTs = (last.firstTs as string) ?? (last.ts as string);
+				events[events.length - 1] = newEvent;
+			} else {
+				events.push(newEvent);
+			}
+			// Bounded, but large enough that a full day of (de-duped) events survives for forensics.
+			if (events.length > 600) {
+				events = events.slice(events.length - 600);
 			}
 			await this.app.vault.adapter.write(
 				path,
@@ -1641,7 +1850,7 @@ export default class RememberCursorPosition extends Plugin {
 		this.logger.info('SYNC', 'Manual cross-device diagnostic', payload);
 		await this.writeSyncDiagnostic('manual-diagnostic', payload);
 		new Notice(
-			`RCP-E diagnostic logged. See rcp-enhanced-logs/ and cursor-state/.diag-${this.settings.deviceId}.json`
+			`RCP-E diagnostic logged. See rcp-enhanced-logs/ and cursor-state/${this.settings.deviceId}.diag.json`
 		);
 		await this.logger.flushToFile();
 	}
@@ -1710,6 +1919,8 @@ export default class RememberCursorPosition extends Plugin {
 				notePath,
 				trigger: `${trigger}/force`,
 				winnerDeviceId,
+				lastAppliedForcedAt: this.lastAppliedForcedAt,
+				candidates: this.lastMergeAnalysis?.candidates,
 				state: summarizeState(merged),
 				editorAfter: summarizeState(this.getEphemeralState()),
 			});
@@ -1761,6 +1972,8 @@ export default class RememberCursorPosition extends Plugin {
 					trigger,
 					reason,
 					winnerDeviceId: this.lastMergeAnalysis?.winnerDeviceId,
+					lastAppliedForcedAt: this.lastAppliedForcedAt,
+					candidates: this.lastMergeAnalysis?.candidates,
 					incoming: summarizeState(merged),
 					applied: summarizeState(this.lastEphemeralState),
 					editorNow,
@@ -1787,6 +2000,8 @@ export default class RememberCursorPosition extends Plugin {
 			notePath,
 			trigger,
 			winnerDeviceId,
+			crossDevice: winnerDeviceId != null && winnerDeviceId !== this.settings.deviceId,
+			candidates: this.lastMergeAnalysis?.candidates,
 			state: summarizeState(merged),
 			editorAfter: summarizeState(this.getEphemeralState()),
 		});
@@ -1872,6 +2087,9 @@ export default class RememberCursorPosition extends Plugin {
 			if (isRemoteDeviceStore) {
 				this.invalidateRemoteDeviceStoreCache(remoteDeviceId);
 				await this.readStateFile(stateFilePath);
+				// A peer's revise-counts / recents may have changed — repaint the badge + history.
+				void this.refreshRevisionUi();
+				this.refreshRecentNotesView();
 				// Acknowledge any force-pushes this peer carries, even if that note isn't open here —
 				// this is what lets the pushing device confirm the force actually landed on us.
 				await this.ackForcesFromRemoteStore(stateFilePath);
@@ -1911,22 +2129,40 @@ export default class RememberCursorPosition extends Plugin {
 	async renameFile(file: TAbstractFile, oldPath: string) {
 		this.logger.info('EVENT', 'Renaming state', { from: oldPath, to: file.path });
 		const oldHash = getFileHash(oldPath);
+		const newHash = getFileHash(file.path);
 		const store = await this.loadOwnDeviceStore();
 		const entry = store.notes[oldHash];
 		if (entry) {
 			await this.writeNoteState(file.path, { ...entry, filePath: file.path });
-			const fresh = await this.loadOwnDeviceStore();
-			const { [oldHash]: _removed, ...rest } = fresh.notes;
-			await this.persistOwnDeviceStore({
-				...fresh,
-				notes: rest,
-				storeRevision: fresh.storeRevision + 1,
-			});
 		}
+
+		// Carry the revise-count and recent-stack entry over to the new path so a rename never
+		// silently zeroes "I revised this 3×" or drops it out of recent history.
+		const fresh = await this.loadOwnDeviceStore();
+		const { [oldHash]: _removedNote, ...notes } = fresh.notes;
+
+		const revisions = { ...(fresh.revisions ?? {}) };
+		if (revisions[oldHash] != null) {
+			revisions[newHash] = (revisions[newHash] ?? 0) + revisions[oldHash];
+			delete revisions[oldHash];
+		}
+
+		const recents = (fresh.recents ?? []).map((r) =>
+			r.path === oldPath ? { path: file.path, hash: newHash, ts: r.ts } : r
+		);
+
+		await this.persistOwnDeviceStore({
+			...fresh,
+			notes: entry ? notes : fresh.notes,
+			revisions,
+			recents,
+			storeRevision: fresh.storeRevision + 1,
+		});
 
 		if (this.lastLoadedFileName === oldPath) {
 			this.lastLoadedFileName = file.path;
 		}
+		this.refreshRecentNotesView();
 	}
 
 	async deleteFile(file: TAbstractFile) {
@@ -2081,6 +2317,184 @@ export default class RememberCursorPosition extends Plugin {
 		this.forcePushFab.style.display = onNote ? 'flex' : 'none';
 	}
 
+	private revisionBadge: HTMLElement | null = null;
+	private revisionStatusEl: HTMLElement | null = null;
+
+	// Tiny pill pinned just above the force button: shows how many times the open note has been
+	// "revised" across ALL devices (e.g. "✓ 3"). One tap = +1; long-press (mobile) or right-click
+	// (desktop) = undo a mistaken mark. Identical placement on laptop/phone/tablet so it's always
+	// where your thumb expects it. Also mirrors into the desktop status bar.
+	private setupRevisionBadge(): void {
+		const style = document.createElement('style');
+		style.textContent =
+			'.rcp-rev-badge{position:fixed;right:20px;bottom:160px;min-width:34px;height:34px;padding:0 10px;' +
+			'border-radius:17px;background:var(--background-secondary);color:var(--text-normal);display:none;' +
+			'align-items:center;justify-content:center;gap:5px;font-size:13px;font-weight:600;line-height:1;' +
+			'box-shadow:0 2px 10px rgba(0,0,0,.4);z-index:99999;cursor:pointer;user-select:none;' +
+			'-webkit-tap-highlight-color:transparent;border:1px solid var(--background-modifier-border)}' +
+			'.rcp-rev-badge:active{transform:scale(.9)}.rcp-rev-badge .rcp-rev-check{color:var(--interactive-accent)}' +
+			'.rcp-rev-status{cursor:pointer}' +
+			// Recent-notes sidebar
+			'.rcp-recent-view{padding:4px 0}' +
+			'.rcp-recent-header{font-size:12px;text-transform:uppercase;letter-spacing:.05em;opacity:.6;' +
+			'padding:6px 12px}' +
+			'.rcp-recent-row{display:flex;align-items:center;gap:8px;padding:7px 12px;cursor:pointer;border-radius:6px}' +
+			'.rcp-recent-row:hover{background:var(--background-modifier-hover)}' +
+			'.rcp-recent-row.is-active{background:var(--background-modifier-active-hover)}' +
+			'.rcp-recent-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}' +
+			'.rcp-recent-folder{font-size:11px;opacity:.5;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}' +
+			'.rcp-recent-count{flex:none;font-size:11px;font-weight:600;color:var(--interactive-accent);' +
+			'background:var(--background-secondary);border-radius:9px;padding:1px 7px}' +
+			'.rcp-recent-empty{padding:14px 12px;opacity:.6;font-size:13px}';
+		document.head.appendChild(style);
+
+		const badge = document.body.createDiv({ cls: 'rcp-rev-badge' });
+		badge.setAttribute('aria-label', 'Tap: mark this note revised · long-press / right-click: undo');
+
+		let longPressTimer = 0;
+		let longPressed = false;
+		const startPress = () => {
+			longPressed = false;
+			longPressTimer = window.setTimeout(() => {
+				longPressed = true;
+				void this.markCurrentNoteRevised(-1);
+			}, 600);
+		};
+		const cancelPress = () => window.clearTimeout(longPressTimer);
+		badge.addEventListener('touchstart', startPress, { passive: true });
+		badge.addEventListener('touchend', cancelPress);
+		badge.addEventListener('touchmove', cancelPress);
+		badge.addEventListener('click', () => {
+			if (longPressed) {
+				longPressed = false;
+				return; // the long-press already handled it (undo); don't also increment
+			}
+			void this.markCurrentNoteRevised(1);
+		});
+		badge.addEventListener('contextmenu', (e) => {
+			e.preventDefault();
+			void this.markCurrentNoteRevised(-1);
+		});
+		this.revisionBadge = badge;
+
+		// Desktop status bar mirror (hidden on mobile, where the floating badge carries the feature).
+		const status = this.addStatusBarItem();
+		status.addClass('rcp-rev-status');
+		status.addEventListener('click', () => void this.markCurrentNoteRevised(1));
+		this.revisionStatusEl = status;
+
+		this.register(() => {
+			badge.remove();
+			style.remove();
+		});
+		void this.refreshRevisionUi();
+	}
+
+	/** Repaint the revision badge + status bar for the currently active note. */
+	async refreshRevisionUi(): Promise<void> {
+		const file = this.app.workspace.getActiveFile();
+		const onNote = !!file && this.shouldTrackFile(file);
+		if (this.revisionBadge) this.revisionBadge.style.display = onNote ? 'flex' : 'none';
+		if (!onNote || !file) {
+			if (this.revisionStatusEl) this.revisionStatusEl.setText('');
+			return;
+		}
+		const total = await this.getTotalRevisions(file.path);
+		if (this.revisionBadge) {
+			this.revisionBadge.empty();
+			this.revisionBadge.createSpan({ cls: 'rcp-rev-check', text: '✓' });
+			this.revisionBadge.createSpan({ text: String(total) });
+			this.revisionBadge.setAttribute(
+				'aria-label',
+				`Revised ${total}× — tap to mark again, long-press / right-click to undo`
+			);
+		}
+		if (this.revisionStatusEl) {
+			this.revisionStatusEl.setText(total > 0 ? `✓ ${total} revised` : '✓ mark revised');
+			this.revisionStatusEl.setAttribute('aria-label', `Click to mark "${file.basename}" revised`);
+		}
+	}
+
+	/** Total revise-count for a note, summed across this device and every synced peer. */
+	async getTotalRevisions(notePath: string): Promise<number> {
+		const stores = await this.loadRemoteDeviceStores(); // includes our own store
+		return getTotalRevisionCount(stores, notePath);
+	}
+
+	/** Mark (or, with a negative delta, unmark) the active note as revised. Adds to THIS device's
+	 *  counter; the displayed total sums every device, so it's conflict-free across the fleet. */
+	async markCurrentNoteRevised(delta: number): Promise<void> {
+		const file = this.app.workspace.getActiveFile();
+		if (!file || !this.shouldTrackFile(file)) {
+			new Notice('RCP-E: open a note first, then mark it revised.');
+			return;
+		}
+		let store = await this.loadOwnDeviceStore();
+		store = incrementOwnRevision(store, file.path, delta);
+		await this.persistOwnDeviceStore(store);
+		const total = await this.getTotalRevisions(file.path);
+		this.logger.info('REVISION', delta >= 0 ? 'Marked note revised' : 'Undid a revision mark', {
+			notePath: file.path,
+			delta,
+			total,
+		});
+		new Notice(
+			delta >= 0 ? `Revised ✓ — ${total}× total` : `Revision mark removed — ${total}× total`
+		);
+		await this.refreshRevisionUi();
+		this.refreshRecentNotesView();
+	}
+
+	/** Push the just-opened note onto this device's recent-reading stack (synced + merged across devices). */
+	async recordRecentVisit(notePath: string): Promise<void> {
+		try {
+			let store = await this.loadOwnDeviceStore();
+			store = recordRecentVisit(store, notePath, Date.now(), RECENTS_LIMIT);
+			await this.persistOwnDeviceStore(store);
+			this.refreshRecentNotesView();
+		} catch (e) {
+			this.logger.warn('REVISION', 'Failed to record recent visit', {
+				notePath,
+				err: e instanceof Error ? e.message : String(e),
+			});
+		}
+	}
+
+	/** The unified recent-reading stack across every device (newest-first). */
+	async getMergedRecents(): Promise<RecentVisit[]> {
+		const stores = await this.loadRemoteDeviceStores();
+		return mergeRecentVisits(stores, RECENTS_LIMIT);
+	}
+
+	/** Open (or focus) the Recent Notes sidebar panel. */
+	async revealRecentNotesView(): Promise<void> {
+		let leaf = this.app.workspace.getLeavesOfType(RECENT_NOTES_VIEW)[0] ?? null;
+		if (!leaf) {
+			leaf = this.app.workspace.getRightLeaf(false);
+			if (leaf) await leaf.setViewState({ type: RECENT_NOTES_VIEW, active: true });
+		}
+		if (leaf) this.app.workspace.revealLeaf(leaf);
+		this.refreshRecentNotesView();
+	}
+
+	/** Re-render any open Recent Notes panels (after a visit, a mark, or a remote sync). */
+	refreshRecentNotesView(): void {
+		for (const leaf of this.app.workspace.getLeavesOfType(RECENT_NOTES_VIEW)) {
+			const view = leaf.view;
+			if (view instanceof RecentNotesView) void view.render();
+		}
+	}
+
+	/** Open a note by vault path (used by the recents panel to jump straight to where you were). */
+	async openNotePath(path: string): Promise<void> {
+		const file = this.app.vault.getAbstractFileByPath(path);
+		if (file instanceof TFile) {
+			await this.app.workspace.getLeaf(false).openFile(file);
+		} else {
+			new Notice(`RCP-E: that note no longer exists (${path}).`);
+		}
+	}
+
 	// Make THIS device authoritative for the current note: stamp its position with a timestamp that
 	// beats every other device (clock-skew-proof) and write it to our own store, bypassing the
 	// normal save guards. The cross-device merge then picks it everywhere — other devices jump to it
@@ -2099,7 +2513,11 @@ export default class RememberCursorPosition extends Plugin {
 		}
 		const merged = await this.readMergedNoteState(notePath);
 		const beat = Math.max(Date.now(), merged?.lastModified ?? 0) + 2000;
-		const forced: EphemeralState = { ...live, filePath: notePath, lastModified: beat, forcedAt: beat };
+		// Bump to a strictly higher authority tier than anything we can currently see. This is the
+		// skew-proof part: from now on no lower-tier state (stale / clock-skewed / orphaned / a peer
+		// that hadn't synced yet) can ever outrank this force, no matter what wall-clock it carries.
+		const authority = (merged?.authority ?? 0) + 1;
+		const forced: EphemeralState = { ...live, filePath: notePath, lastModified: beat, forcedAt: beat, authority };
 		let store = await this.loadOwnDeviceStore();
 		store = upsertNoteInStore(store, notePath, forced);
 		await this.persistOwnDeviceStore(store);
@@ -2109,6 +2527,16 @@ export default class RememberCursorPosition extends Plugin {
 		this.logger.info('FORCE', 'Force-pushed position to all devices', {
 			notePath,
 			forced: summarizeState(forced),
+		});
+		// Record the push and exactly what it had to beat at push time. If it later reverts, comparing
+		// this against the winning candidate's lastModified pinpoints the skewed/stale device.
+		void this.writeSyncDiagnostic('force-pushed', {
+			notePath,
+			noteHash: getFileHash(notePath),
+			beat,
+			forced: summarizeState(forced),
+			beatOverMergedMs: beat - (merged?.lastModified ?? 0),
+			candidatesAtPush: this.lastMergeAnalysis?.candidates,
 		});
 		await this.verifyForcePush(notePath, beat);
 	}
@@ -3380,5 +3808,75 @@ class SettingTab extends PluginSettingTab {
 					});
 				});
 		});
+	}
+}
+
+// Right-sidebar panel listing the notes you've recently opened, newest-first, merged across every
+// device (browser-history style). One tap jumps you straight back to where you were reading — no
+// hunting through the folder tree of thousands of notes. Each row also shows that note's revise-count.
+class RecentNotesView extends ItemView {
+	plugin: RememberCursorPosition;
+
+	constructor(leaf: WorkspaceLeaf, plugin: RememberCursorPosition) {
+		super(leaf);
+		this.plugin = plugin;
+	}
+
+	getViewType(): string {
+		return RECENT_NOTES_VIEW;
+	}
+
+	getDisplayText(): string {
+		return 'Recent notes';
+	}
+
+	getIcon(): string {
+		return 'history';
+	}
+
+	async onOpen(): Promise<void> {
+		await this.render();
+	}
+
+	async onClose(): Promise<void> {
+		// nothing to tear down
+	}
+
+	async render(): Promise<void> {
+		const container = this.contentEl;
+		container.empty();
+		container.addClass('rcp-recent-view');
+		container.createDiv({ cls: 'rcp-recent-header', text: 'Recently read · all devices' });
+
+		const recents = await this.plugin.getMergedRecents();
+		if (recents.length === 0) {
+			container.createDiv({
+				cls: 'rcp-recent-empty',
+				text: 'No recent notes yet — open a few and they’ll stack up here.',
+			});
+			return;
+		}
+
+		const stores = await this.plugin.loadRemoteDeviceStores();
+		const activePath = this.app.workspace.getActiveFile()?.path;
+
+		for (const visit of recents) {
+			const row = container.createDiv({ cls: 'rcp-recent-row' });
+			if (visit.path === activePath) row.addClass('is-active');
+			row.setAttribute('aria-label', visit.path);
+
+			const slash = visit.path.lastIndexOf('/');
+			const fileName = (slash >= 0 ? visit.path.slice(slash + 1) : visit.path).replace(/\.md$/i, '');
+			const folder = slash >= 0 ? visit.path.slice(0, slash) : '';
+
+			const textWrap = row.createDiv({ cls: 'rcp-recent-name' });
+			textWrap.createSpan({ text: fileName });
+			if (folder) textWrap.createDiv({ cls: 'rcp-recent-folder', text: folder });
+
+			const count = getTotalRevisionCount(stores, visit.path);
+			if (count > 0) row.createSpan({ cls: 'rcp-recent-count', text: `✓ ${count}` });
+
+			row.addEventListener('click', () => void this.plugin.openNotePath(visit.path));
+		}
 	}
 }

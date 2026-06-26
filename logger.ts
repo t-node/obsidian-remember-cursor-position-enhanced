@@ -11,6 +11,7 @@ export type LogCategory =
 	| 'STATE'
 	| 'SETTINGS'
 	| 'FORCE'
+	| 'REVISION'
 	| 'ERROR';
 
 export interface LoggerOptions {
@@ -27,7 +28,9 @@ export interface LoggerOptions {
 }
 
 const LOG_PREFIX = 'RCP-E';
-const MAX_LOG_BYTES = 512_000;
+// 4 MB keeps roughly a full day of verbose per-device logs (not synced — pulled via adb/USB for a
+// post-mortem), so an issue hit in the morning is still in the log when you connect devices that night.
+const MAX_LOG_BYTES = 4_000_000;
 export const LOG_DIR = 'rcp-enhanced-logs';
 
 /** Paths that must never be written — they cause Syncthing conflicts when shared across devices. */
@@ -61,6 +64,7 @@ export function summarizeState(state: EphemeralState | null | undefined): Record
 		anchorLine: state.anchorLine,
 		lastModified: state.lastModified,
 		revision: state.revision,
+		forcedAt: state.forcedAt,
 	};
 }
 
