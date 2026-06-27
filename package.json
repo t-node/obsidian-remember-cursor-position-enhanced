@@ -10,6 +10,7 @@
     "deploy": "node scripts/deploy.mjs",
     "deploy-all": "pwsh scripts/deploy-all.ps1",
     "sync-debug": "pwsh scripts/sync-debug.ps1",
+    "sync-speed": "pwsh scripts/sync-speed.ps1",
     "release": "node scripts/release.mjs",
     "vault-cleanup": "node scripts/vault-cleanup.mjs"
   },

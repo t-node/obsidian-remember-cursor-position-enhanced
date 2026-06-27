@@ -118,10 +118,13 @@ if (Test-Path $masterVault) {
     $distDir = Join-Path $masterVault 'plugin-dist'
     New-Item -ItemType Directory -Force -Path $distDir | Out-Null
     foreach ($f in @('main.js', 'manifest.json')) { Copy-Item (Join-Path $repoRoot $f) (Join-Path $distDir $f) -Force }
-    # Ship the double-click bootstrapper alongside it, so a device on an OLD build (e.g. the office
-    # laptop, no adb/SSH) can self-install once by running plugin-dist\install-here.cmd.
-    $installer = Join-Path $PSScriptRoot 'install-here.cmd'
-    if (Test-Path $installer) { Copy-Item $installer (Join-Path $distDir 'install-here.cmd') -Force }
+    # Ship the double-click helpers alongside it, so a device with no adb/SSH (e.g. the office laptop)
+    # can self-install the build (install-here.cmd) and set its Syncthing watcher delay for fast sync
+    # (set-watcher-here.cmd/.ps1) — both reach it through this synced folder.
+    foreach ($helper in @('install-here.cmd', 'set-watcher-here.cmd', 'set-watcher-here.ps1')) {
+        $src = Join-Path $PSScriptRoot $helper
+        if (Test-Path $src) { Copy-Item $src (Join-Path $distDir $helper) -Force }
+    }
     if (Test-SameFile (Join-Path $distDir 'main.js') $srcMain) {
         Write-Host "  OK    -> $distDir  [verified ✓]  (Syncthing carries this to every device)" -ForegroundColor Green
         $results.Add(@{ Device = 'plugin-dist (all via sync)'; Status = 'delivered + verified ✓' })

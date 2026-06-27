@@ -108,12 +108,14 @@ const AGGRESSIVE_SYNC_RETRY_RESTORE_MS = 1500;
 const CROSS_DEVICE_SYNC_WATCH_MS = 60000;
 // Force-push confirmation: poll peer acks every POLL ms, up to TIMEOUT (covers online devices on
 // the same network; offline ones are reported as pending rather than waited on indefinitely).
-const FORCE_VERIFY_POLL_MS = 1500;
+// Tight poll so the "confirmed ✓" lands as soon as the ack round-trips (with fsWatcherDelayS=0.2s on
+// every device + direct connections, an ack typically comes home in well under a second).
+const FORCE_VERIFY_POLL_MS = 400;
 const FORCE_VERIFY_TIMEOUT_MS = 20000;
 // After the live window, keep confirming quietly in the background up to this long, so an always-on
 // device whose ack round-trip is just slow still gets acknowledged (with a follow-up notice).
 const FORCE_VERIFY_EXTENDED_MS = 120000;
-const FORCE_VERIFY_BG_POLL_MS = 3000;
+const FORCE_VERIFY_BG_POLL_MS = 2000;
 const SYNC_RETRY_DELAYS_AGGRESSIVE = [1500, 4000, 8000, 15000, 30000, 60000];
 const SYNC_RETRY_DELAYS_NORMAL = [3000, 7000, 12000, 20000, 45000, 60000];
 const LEGACY_DB_FILENAME = '.obsidian/plugins/remember-cursor-position/cursor-positions.json';
