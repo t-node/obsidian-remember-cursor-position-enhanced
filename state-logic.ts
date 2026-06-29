@@ -21,6 +21,9 @@ export interface EphemeralState {
 	 *  overriding the active-reading and weak-scroll guards. Value is the push timestamp, used
 	 *  by receivers to dedupe (honor each force exactly once). */
 	forcedAt?: number;
+	/** Set when the force-push should also OPEN this note on the other devices ("follow me"), not just
+	 *  sync the position once they're already on it. Receivers open the note on the newest such push. */
+	forcedOpen?: boolean;
 }
 
 export interface TaggedNoteState extends EphemeralState {

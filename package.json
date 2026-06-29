@@ -12,7 +12,8 @@
     "sync-debug": "pwsh scripts/sync-debug.ps1",
     "sync-speed": "pwsh scripts/sync-speed.ps1",
     "release": "node scripts/release.mjs",
-    "vault-cleanup": "node scripts/vault-cleanup.mjs"
+    "vault-cleanup": "node scripts/vault-cleanup.mjs",
+    "keep-alive": "pwsh scripts/keep-android-alive.ps1"
   },
   "keywords": [],
   "author": "",

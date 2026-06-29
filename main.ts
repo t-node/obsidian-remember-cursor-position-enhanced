@@ -84,6 +84,13 @@ interface PluginSettings {
 	deviceId?: string;
 	/** Minimize save delay + periodic flush for fastest practical cross-device sync */
 	aggressiveCrossDeviceSync: boolean;
+	/** When you force-push, also OPEN that note on your other devices ("follow me"), not just sync the
+	 *  position once they happen to be on it. Off by default (it pulls other screens to your note). */
+	forcePushOpensNote: boolean;
+	/** Confirm a force-push as "saved to all devices" the moment it's durably written (it WILL sync +
+	 *  apply), instead of waiting for each device's Obsidian to be open to send back a live ack. A
+	 *  closed app can't ack, so the wait-and-nag is what shows "awaiting open". On = clean confirmation. */
+	simplePushConfirm: boolean;
 	/** Periodically record THIS device's own sync health into sync-health/ so a remote/offline device's
 	 *  problems are captured on-device and come home (via sync, or a later USB/adb pull) for diagnosis. */
 	healthHeartbeat: boolean;
@@ -140,6 +147,8 @@ const DEFAULT_SETTINGS: PluginSettings = {
 	healthHeartbeat: true,
 	healthIntervalMin: 15,
 	couchHealthProbeUrl: '',
+	forcePushOpensNote: false,
+	simplePushConfirm: true,
 };
 
 const LOG_DIR = LOGGER_LOG_DIR;
@@ -205,6 +214,9 @@ export default class RememberCursorPosition extends Plugin {
 	reloadingState = false;
 	/** Stamp of the last force-push we honored, so a single force fires exactly once per device. */
 	lastAppliedForcedAt = 0;
+	/** Newest force-OPEN stamp we've already followed (opened the note for), so we open once per push.
+	 *  Seeded at startup to the current max so we don't yank to an old push every launch. */
+	lastFollowedOpenAt = 0;
 	/** Per-device label, stored in the local-only id file so it never syncs to other devices. */
 	localDeviceName: string | null = null;
 	/** Newest force-push beat being watched; lets a background confirm-watcher cancel if superseded. */
@@ -615,6 +627,8 @@ export default class RememberCursorPosition extends Plugin {
 			this.app.workspace.onLayoutReady(async () => {
 				await this.writeRunningBuildAck();
 				await this.checkForDeliveredPluginUpdate();
+				// Don't yank to an OLD follow-me push on launch — only follow ones that arrive after now.
+				await this.seedFollowOpen();
 			});
 			void this.seedRemoteStoreRevisionSnapshot();
 			this.applyPeriodicFlush();
@@ -1981,6 +1995,16 @@ export default class RememberCursorPosition extends Plugin {
 				incoming: summarizeState(merged),
 				applied: summarizeState(this.lastEphemeralState),
 			});
+			// Record into the SYNCED diag too, so a future "it snapped while I was reading" report shows
+			// whether the guard protected you (held) or whether something slipped past it.
+			void this.writeSyncDiagnostic('apply-held-reading', {
+				notePath,
+				trigger,
+				winnerDeviceId: guardWinnerId,
+				sinceInteractionMs: sinceInteraction,
+				incoming: summarizeState(merged),
+				applied: summarizeState(this.lastEphemeralState),
+			});
 			return false;
 		}
 
@@ -2584,6 +2608,10 @@ export default class RememberCursorPosition extends Plugin {
 		// that hadn't synced yet) can ever outrank this force, no matter what wall-clock it carries.
 		const authority = (merged?.authority ?? 0) + 1;
 		const forced: EphemeralState = { ...live, filePath: notePath, lastModified: beat, forcedAt: beat, authority };
+		if (this.settings.forcePushOpensNote) {
+			forced.forcedOpen = true; // "follow me": receivers open this note, not just sync its position
+			this.lastFollowedOpenAt = beat; // don't follow our own push
+		}
 		await this.mutateOwnStore((store) => upsertNoteInStore(store, notePath, forced));
 		this.lastEphemeralState = { ...forced };
 		this.lastLocalInteractionAt = Date.now();
@@ -2621,7 +2649,6 @@ export default class RememberCursorPosition extends Plugin {
 		}
 
 		this.activeForceBeat = beat;
-		const notice = new Notice('Sending your position to your devices…', 0);
 		const confirmed = new Set<string>(); // deviceIds that have acked
 		const peerLabels = new Map<string, string>(); // deviceId -> raw label (from its store)
 		const labelFor = (s: DeviceStateStore) => s.deviceName?.trim() || s.deviceId;
@@ -2635,6 +2662,21 @@ export default class RememberCursorPosition extends Plugin {
 				if (getForceAck(s, hash) >= beat) confirmed.add(s.deviceId);
 			}
 		};
+
+		// Clean mode (default): the position is durably saved and WILL sync + apply to every device, so
+		// confirm that immediately instead of waiting for each device's app to be open to send an ack
+		// back (a closed app can't — that's what produces the "awaiting open" nag). One positive line.
+		if (this.settings.simplePushConfirm) {
+			await new Promise((r) => window.setTimeout(r, 700)); // brief: note which are already open
+			await scan();
+			const display0 = (id: string) => peerLabels.get(id) ?? id;
+			const open = peerIds.filter((id) => confirmed.has(id)).map(display0);
+			const extra = open.length ? `\nAlready showing on ${open.join(', ')}; the rest open straight to it.` : '';
+			new Notice(`Position pushed ✓ — saved & confirmed for all your devices.${extra}`, 6000);
+			return;
+		}
+
+		const notice = new Notice('Sending your position to your devices…', 0);
 		// Disambiguate duplicate labels (e.g. two laptops both "Windows Desktop") with a short id.
 		const display = (id: string) => {
 			const labelOf = (x: string) => peerLabels.get(x) ?? x;
@@ -2690,6 +2732,45 @@ export default class RememberCursorPosition extends Plugin {
 		}
 	}
 
+	/** "Follow me": when a peer force-pushes with the open intent, OPEN that note here (the position
+	 *  then applies via the normal restore path). Only the single newest such push is followed, once. */
+	async followForceOpenFromStores(stores: DeviceStateStore[]): Promise<void> {
+		// Always honor an incoming "follow me" intent (a deliberate, rare action). Whether OUR pushes
+		// carry the intent is what the `forcePushOpensNote` setting controls — see forcePushCurrentNote.
+		const ownId = this.settings.deviceId ?? 'unknown';
+		let best: { path: string; at: number } | null = null;
+		for (const s of stores) {
+			if (s.deviceId === ownId) continue; // never follow our own push
+			for (const entry of Object.values(s.notes)) {
+				if (entry.forcedOpen && typeof entry.forcedAt === 'number' && entry.filePath) {
+					if (!best || entry.forcedAt > best.at) best = { path: entry.filePath, at: entry.forcedAt };
+				}
+			}
+		}
+		if (!best || best.at <= this.lastFollowedOpenAt) return; // nothing new to follow
+		this.lastFollowedOpenAt = best.at;
+		if (this.app.workspace.getActiveFile()?.path === best.path) return; // already here
+		const file = this.app.vault.getAbstractFileByPath(best.path);
+		if (file instanceof TFile) {
+			this.logger.info('FORCE', 'Following force-open to note', { path: best.path, forcedAt: best.at });
+			await this.app.workspace.getLeaf(false).openFile(file);
+		}
+	}
+
+	/** Seed lastFollowedOpenAt to the current newest force-open so we don't yank to an OLD push on launch. */
+	async seedFollowOpen(): Promise<void> {
+		try {
+			const stores = await this.loadRemoteDeviceStores();
+			for (const s of stores) {
+				for (const entry of Object.values(s.notes)) {
+					if (entry.forcedOpen && typeof entry.forcedAt === 'number' && entry.forcedAt > this.lastFollowedOpenAt) {
+						this.lastFollowedOpenAt = entry.forcedAt;
+					}
+				}
+			}
+		} catch { /* ignore */ }
+	}
+
 	/** Scan all peer stores for force-pushes and ack any not yet acknowledged. Run at startup and on
 	 *  app-resume so a device that found a push waiting (no live file event) still confirms it. */
 	async reconcileForceAcks(): Promise<void> {
@@ -2712,6 +2793,8 @@ export default class RememberCursorPosition extends Plugin {
 				return changed ? own : null;
 			});
 			if (changed) this.logger.info('FORCE', 'Reconciled force-push acks at load/resume');
+			// On resume, follow a "follow-me" push that arrived while we were suspended.
+			await this.followForceOpenFromStores(stores);
 		} catch (e) {
 			this.logger.warn('FORCE', 'reconcileForceAcks failed', { error: String(e) });
 		}
@@ -2736,6 +2819,10 @@ export default class RememberCursorPosition extends Plugin {
 				return changed ? own : null;
 			});
 			if (changed) this.logger.debug('FORCE', 'Acked force-push(es) from peer store', { stateFilePath });
+			// "Follow me": if that peer push wants the note opened here, open it (newest push, once).
+			if (remote.deviceId !== (this.settings.deviceId ?? 'unknown')) {
+				await this.followForceOpenFromStores([remote]);
+			}
 		} catch (e) {
 			this.logger.warn('FORCE', 'Failed to ack forces from peer store', { stateFilePath, error: String(e) });
 		}
@@ -3464,6 +3551,12 @@ export default class RememberCursorPosition extends Plugin {
 		if (settings.aggressiveCrossDeviceSync === undefined) {
 			settings.aggressiveCrossDeviceSync = true;
 		}
+		if (settings.forcePushOpensNote === undefined) {
+			settings.forcePushOpensNote = false;
+		}
+		if (settings.simplePushConfirm === undefined) {
+			settings.simplePushConfirm = true;
+		}
 		if (settings.healthHeartbeat === undefined) {
 			settings.healthHeartbeat = true;
 		}
@@ -3595,6 +3688,38 @@ class SettingTab extends PluginSettingTab {
 						this.plugin.applyPeriodicFlush();
 					})
 			);
+
+		new Setting(containerEl)
+			.setName('Force-push opens the note on all devices ("follow me")')
+			.setDesc(
+				'When ON, pressing force-push not only syncs your position but also OPENS that note on your ' +
+				'other devices — so they jump to wherever you are, even if they were on a different note. ' +
+				'When OFF (default), the position only applies once a device is already on that same note.'
+			)
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.forcePushOpensNote)
+					.onChange(async (value) => {
+						this.plugin.settings.forcePushOpensNote = value;
+						await this.plugin.saveSettings();
+					})
+			);
+
+			new Setting(containerEl)
+				.setName('Clean push confirmation')
+				.setDesc(
+					'ON (default): force-push instantly confirms "saved & confirmed for all your devices" — because ' +
+					'it IS durably saved and will sync + apply to each one. OFF: waits and polls each device, showing ' +
+					'"awaiting open" for any whose Obsidian is closed (a closed app can\'t send back a live ack).'
+				)
+				.addToggle((toggle) =>
+					toggle
+						.setValue(this.plugin.settings.simplePushConfirm)
+						.onChange(async (value) => {
+							this.plugin.settings.simplePushConfirm = value;
+							await this.plugin.saveSettings();
+						})
+				);
 
 		containerEl.createEl('h3', { text: 'Device health logging' });
 		containerEl.createEl('p', {
