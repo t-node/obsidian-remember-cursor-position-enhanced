@@ -260,6 +260,16 @@ function mergeRecentVisits(stores, limit = RECENTS_LIMIT) {
 	return mergeRecentLists(stores.map((s) => s.recents), limit);
 }
 
+// Mirror of device-store.ts mergeRevisionCounts — conflict copies of a device's store keep the MAX
+// count per note, so a revision tally can never DECREASE on a merge (durability guarantee).
+function mergeRevisionCounts(a, b) {
+	const out = { ...(a ?? {}) };
+	for (const [hash, count] of Object.entries(b ?? {})) {
+		out[hash] = Math.max(out[hash] ?? 0, count);
+	}
+	return out;
+}
+
 let passed = 0;
 let failed = 0;
 
@@ -659,6 +669,20 @@ test('recordRecentVisit: caps the stack at the limit', () => {
 	for (let i = 0; i < 5; i++) s = recordRecentVisit(s, `n${i}.md`, i, 3);
 	assert.equal(s.recents.length, 3);
 	assert.deepEqual(s.recents.map((r) => r.path), ['n4.md', 'n3.md', 'n2.md']);
+});
+
+test('revision DURABILITY: conflict-merge keeps the MAX count — never loses a tally', () => {
+	// Two conflict copies of the same device's store (e.g. from sync) — must keep the higher count.
+	assert.deepEqual(mergeRevisionCounts({ a: 3, b: 2 }, { a: 1, b: 5 }), { a: 3, b: 5 });
+	// A note present in only one copy survives.
+	assert.deepEqual(mergeRevisionCounts({ a: 4 }, {}), { a: 4 });
+	assert.deepEqual(mergeRevisionCounts({}, { a: 4 }), { a: 4 });
+});
+
+test('revision DURABILITY: total is the SUM across devices (G-Counter, conflict-free)', () => {
+	const hash = getFileHash('Notes/OS.md');
+	const stores = [{ revisions: { [hash]: 3 } }, { revisions: { [hash]: 2 } }, { revisions: { [hash]: 5 } }];
+	assert.equal(getTotalRevisionCount(stores, 'Notes/OS.md'), 10); // 3+2+5, no loss
 });
 
 test('mergeRecentVisits: unifies devices newest-first, one row per note', () => {

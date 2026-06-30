@@ -147,8 +147,8 @@ const DEFAULT_SETTINGS: PluginSettings = {
 	healthHeartbeat: true,
 	healthIntervalMin: 15,
 	couchHealthProbeUrl: '',
-	forcePushOpensNote: false,
-	simplePushConfirm: true,
+	forcePushOpensNote: true,
+	simplePushConfirm: false,
 };
 
 const LOG_DIR = LOGGER_LOG_DIR;
@@ -1006,8 +1006,9 @@ export default class RememberCursorPosition extends Plugin {
 			}
 		} catch { /* keep settings id */ }
 		await this.app.vault.adapter.write(path, JSON.stringify({ deviceId, deviceName: name }, null, 2));
-		const store = await this.loadOwnDeviceStore();
-		await this.persistOwnDeviceStore(store);
+		// Re-stamp our store (deviceName) through the serializer so it can't clobber a concurrent
+		// revision-count / recents write (persistOwnDeviceStore re-applies the name; we just touch it).
+		await this.mutateOwnStore((store) => store);
 	}
 
 	private async cleanupLegacyLogsInDir(
@@ -1974,6 +1975,26 @@ export default class RememberCursorPosition extends Plugin {
 			return true;
 		}
 
+		// Cross-device scroll is DEVICE-SPECIFIC: different screen sizes render the same line at a
+		// different scroll pixel (e.g. line 517 = scroll 523 on the laptop but 509 on the tablet, which
+		// can't even reach 523 — it clamps). If the editor's CURSOR is already at the merged cursor (a
+		// real, non-origin position), we're already where we should be; re-applying just because the
+		// scroll number differs would yank the editor every poll forever (the "it keeps resetting" bug).
+		const live = this.getEphemeralState();
+		if (
+			merged.cursor && live.cursor && !isCaretAtOrigin(merged) &&
+			merged.cursor.from.line === live.cursor.from.line &&
+			merged.cursor.from.ch === live.cursor.from.ch &&
+			merged.cursor.to.line === live.cursor.to.line &&
+			merged.cursor.to.ch === live.cursor.to.ch
+		) {
+			this.lastEphemeralState = merged; // satisfied — mark so later polls see "already equal"
+			this.logger.debug('SYNC', 'Merged state already at target line — scroll differs (device render), not re-applying', {
+				notePath, mergedScroll: merged.scroll, editorScroll: live.scroll, cursorLine: merged.cursor.from.line,
+			});
+			return false;
+		}
+
 		// Active-reading guard (skew-proof, local clock only): if the user has scrolled/moved on
 		// THIS note within the guard window, a remote device's position must not yank it away.
 		// Note-open restores use a different path (restoreNoteState), so first-open is unaffected.
@@ -2676,7 +2697,7 @@ export default class RememberCursorPosition extends Plugin {
 			return;
 		}
 
-		const notice = new Notice('Sending your position to your devices…', 0);
+		const notice = new Notice('Waiting for your devices to scroll to this position…', 0);
 		// Disambiguate duplicate labels (e.g. two laptops both "Windows Desktop") with a short id.
 		const display = (id: string) => {
 			const labelOf = (x: string) => peerLabels.get(x) ?? x;
@@ -2684,12 +2705,13 @@ export default class RememberCursorPosition extends Plugin {
 			return dupes > 1 ? `${labelOf(id)} (${id.slice(0, 4)})` : labelOf(id);
 		};
 
-		// Phase 1 — live window with a progress notice.
+		// Phase 1 — live window: WAIT until each device has actually applied it on screen (acks come only
+		// after the editor scrolls there — see applyScrollState), then report success.
 		const deadline = Date.now() + FORCE_VERIFY_TIMEOUT_MS;
 		while (Date.now() < deadline && confirmed.size < peerIds.length) {
 			await new Promise((r) => window.setTimeout(r, FORCE_VERIFY_POLL_MS));
 			await scan();
-			notice.setMessage(`Sending your position… ${confirmed.size}/${peerIds.length} devices confirmed`);
+			notice.setMessage(`Updating your devices… ${confirmed.size}/${peerIds.length} scrolled to it on screen`);
 		}
 		notice.hide();
 
@@ -2701,16 +2723,16 @@ export default class RememberCursorPosition extends Plugin {
 		});
 
 		if (pendingIds().length === 0) {
-			new Notice(`✅ Confirmed — all ${peerIds.length} devices have this position\n${peerIds.map(display).join(', ')}`, 8000);
+			new Notice(`✅ Done — all ${peerIds.length} devices scrolled to your position on screen\n${peerIds.map(display).join(', ')}`, 8000);
 			return;
 		}
 
 		const confirmedNow = peerIds.filter((id) => confirmed.has(id)).map(display);
 		new Notice(
 			`Position pushed ✓\n` +
-			`✅ Confirmed (read it): ${confirmedNow.length ? confirmedNow.join(', ') : '— none yet'}\n` +
-			`📤 Sent, awaiting open: ${pendingIds().map(display).join(', ')}\n` +
-			`Your position is saved for them — each jumps to it the instant its Obsidian is open. No need to resend; I'll keep checking.`,
+			`✅ Scrolled to it on screen: ${confirmedNow.length ? confirmedNow.join(', ') : '— none yet'}\n` +
+			`⏳ Not applied yet (open Obsidian on that note): ${pendingIds().map(display).join(', ')}\n` +
+			`Still watching — these confirm the moment that device opens the note and scrolls to it.`,
 			14000
 		);
 
@@ -2724,9 +2746,9 @@ export default class RememberCursorPosition extends Plugin {
 			const newlyConfirmed = peerIds.filter((id) => confirmed.has(id) && !wasConfirmed.has(id)).map(display);
 			if (newlyConfirmed.length > 0) {
 				if (pendingIds().length === 0) {
-					new Notice(`✅ All ${peerIds.length} devices now have this position\n${peerIds.map(display).join(', ')}`, 8000);
+					new Notice(`✅ Done — all ${peerIds.length} devices scrolled to your position\n${peerIds.map(display).join(', ')}`, 8000);
 				} else {
-					new Notice(`✅ ${newlyConfirmed.join(', ')} now confirmed (${confirmed.size}/${peerIds.length})`, 6000);
+					new Notice(`✅ ${newlyConfirmed.join(', ')} scrolled to it on screen (${confirmed.size}/${peerIds.length})`, 6000);
 				}
 			}
 		}
@@ -2777,23 +2799,8 @@ export default class RememberCursorPosition extends Plugin {
 		try {
 			this.remoteDeviceStoresCache.clear();
 			const stores = await this.loadRemoteDeviceStores();
-			const ownId = this.settings.deviceId ?? 'unknown';
-			let changed = false;
-			await this.mutateOwnStore((own) => {
-				for (const s of stores) {
-					if (s.deviceId === ownId) continue;
-					for (const [hash, entry] of Object.entries(s.notes)) {
-						const forcedAt = entry.forcedAt;
-						if (typeof forcedAt === 'number' && forcedAt > getForceAck(own, hash)) {
-							own = recordForceAck(own, hash, forcedAt);
-							changed = true;
-						}
-					}
-				}
-				return changed ? own : null;
-			});
-			if (changed) this.logger.info('FORCE', 'Reconciled force-push acks at load/resume');
-			// On resume, follow a "follow-me" push that arrived while we were suspended.
+			// On load/resume, follow a "follow-me" push that arrived while we were suspended; the ack is
+			// written only once it actually applies on screen (applyScrollState), keeping it truthful.
 			await this.followForceOpenFromStores(stores);
 		} catch (e) {
 			this.logger.warn('FORCE', 'reconcileForceAcks failed', { error: String(e) });
@@ -2807,19 +2814,10 @@ export default class RememberCursorPosition extends Plugin {
 			if (!(await adapter.exists(stateFilePath))) return;
 			const remote = parseDeviceStoreJson(await adapter.read(stateFilePath));
 			if (!remote) return;
-			let changed = false;
-			await this.mutateOwnStore((own) => {
-				for (const [hash, entry] of Object.entries(remote.notes)) {
-					const forcedAt = entry.forcedAt;
-					if (typeof forcedAt === 'number' && forcedAt > getForceAck(own, hash)) {
-						own = recordForceAck(own, hash, forcedAt);
-						changed = true;
-					}
-				}
-				return changed ? own : null;
-			});
-			if (changed) this.logger.debug('FORCE', 'Acked force-push(es) from peer store', { stateFilePath });
-			// "Follow me": if that peer push wants the note opened here, open it (newest push, once).
+			// NOTE: we deliberately do NOT ack here on mere receipt — the ack now happens only after the
+			// position is actually applied on screen (see applyScrollState), so the pusher's confirmation
+			// reflects real on-screen state. We just make the note open ("follow me"), which leads to the
+			// apply → ack on this device.
 			if (remote.deviceId !== (this.settings.deviceId ?? 'unknown')) {
 				await this.followForceOpenFromStores([remote]);
 			}
@@ -3163,6 +3161,17 @@ export default class RememberCursorPosition extends Plugin {
 			editorAfter,
 			scrollDelta: (editorAfter.scroll as number ?? 0) - (st.scroll ?? 0),
 		});
+		// TRUTHFUL ack: only NOW — after the editor has actually applied a force-pushed position on
+		// screen — do we acknowledge it. The pusher's confirmation waits for THIS, so "confirmed" means
+		// "the device scrolled to it on screen", not merely "the file arrived". Fires on EVERY apply path
+		// (force-override AND the follow-me note-open restore). Acking our own force is harmless — the
+		// pusher excludes its own store from the confirmation scan.
+		if (typeof st.forcedAt === 'number') {
+			const ackHash = getFileHash(notePath);
+			const ackAt = st.forcedAt;
+			void this.mutateOwnStore((store) => recordForceAck(store, ackHash, ackAt));
+			this.logger.info('FORCE', 'Acked force AFTER applying it on screen', { notePath, forcedAt: ackAt, crossDevice });
+		}
 		await this.verifyScrollRestore(notePath, st, crossDevice);
 	}
 
@@ -3552,10 +3561,10 @@ export default class RememberCursorPosition extends Plugin {
 			settings.aggressiveCrossDeviceSync = true;
 		}
 		if (settings.forcePushOpensNote === undefined) {
-			settings.forcePushOpensNote = false;
+			settings.forcePushOpensNote = true;
 		}
 		if (settings.simplePushConfirm === undefined) {
-			settings.simplePushConfirm = true;
+			settings.simplePushConfirm = false;
 		}
 		if (settings.healthHeartbeat === undefined) {
 			settings.healthHeartbeat = true;
@@ -3692,9 +3701,10 @@ class SettingTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName('Force-push opens the note on all devices ("follow me")')
 			.setDesc(
-				'When ON, pressing force-push not only syncs your position but also OPENS that note on your ' +
-				'other devices — so they jump to wherever you are, even if they were on a different note. ' +
-				'When OFF (default), the position only applies once a device is already on that same note.'
+				'ON (default): pressing force-push OPENS that note on every other open device and jumps it to ' +
+				'your position — even if it was on a different note. This is what makes "push from one device, ' +
+				'everything follows" work. Turn OFF if you only want the position to apply when a device is ' +
+				'already on that same note.'
 			)
 			.addToggle((toggle) =>
 				toggle
